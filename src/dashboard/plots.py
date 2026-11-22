@@ -1,8 +1,8 @@
 """Interactive dark-glassmorphic Plotly visualization builders for Milestone 3:
-  1. Spatial Posture Donut & Workstation Utilization Donut (matching executive dark UI)
+  1. Spatial Posture Donut & Workstation Utilization Donut (with unclipped outside callouts)
   2. Glowing KPI Sparklines (Working % & Idle % trends)
-  3. Interactive Ergonomic Posture & Activity Gantt Timeline + Shoulder Elevation Curve
-  4. 2D Rolling Wrist Velocity Activity Heatmap
+  3. Multi-employee (`1..N`) Ergonomic Posture & Activity Gantt Timeline + Normalized Shoulder Elevation
+  4. Scale-Invariant (`SW/s`) 2D Rolling Wrist Velocity Activity Heatmap
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from src.dashboard.data_loader import (
     format_duration_mmss,
 )
 
-# Color palette engineered to match the target dark executive dashboard UI
 POSTURE_COLORS: Dict[str, str] = {
     "Sitting": "#23478E",
     "Standing": "#5D3FD3",
@@ -35,6 +34,21 @@ UTILIZATION_COLORS: Dict[str, str] = {
     "Away": "#2CA89A",
 }
 
+EMPLOYEE_TRACE_PALETTE: List[str] = [
+    "#38BDF8",
+    "#A78BFA",
+    "#34D399",
+    "#FBBF24",
+    "#F472B6",
+    "#FB923C",
+    "#2DD4BF",
+    "#818CF8",
+    "#A3E635",
+    "#F87171",
+    "#C084FC",
+    "#67E8F9",
+]
+
 CARD_BG = "rgba(0,0,0,0)"
 DARK_SLICE_BORDER = "#131720"
 TEXT_PRIMARY = "#F0F6FC"
@@ -44,9 +58,9 @@ GRID_SUBTLE = "rgba(148, 163, 184, 0.12)"
 
 def build_posture_donut_figure(
     kpis: Dict[str, Any],
-    height: int = 410,
+    height: int = 420,
 ) -> go.Figure:
-    """Build the Spatial Posture & Presence Donut Chart matching the executive dark UI mockup."""
+    """Build the Spatial Posture & Presence Donut Chart with automatic callout margin protection."""
     pb = kpis.get("posture_breakdown", {})
     labels = list(POSTURE_ORDER)
     counts = [int(pb.get(lbl, {}).get("count", 0)) for lbl in labels]
@@ -54,7 +68,6 @@ def build_posture_donut_figure(
     pcts = [float(pb.get(lbl, {}).get("pct", 0.0)) for lbl in labels]
     colors = [POSTURE_COLORS[lbl] for lbl in labels]
 
-    # Guard empty state
     if sum(counts) == 0:
         counts = [0, 0, 0, 1]
         pcts = [0.0, 0.0, 0.0, 100.0]
@@ -77,6 +90,7 @@ def build_posture_donut_figure(
                 sort=False,
                 direction="clockwise",
                 rotation=0,
+                automargin=True,
                 marker=dict(
                     colors=colors,
                     line=dict(color=DARK_SLICE_BORDER, width=3),
@@ -84,7 +98,7 @@ def build_posture_donut_figure(
                 text=callout_text,
                 textinfo="text",
                 textposition="outside",
-                textfont=dict(size=14, color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
+                textfont=dict(size=13.5, color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
                 hovertext=hover_text,
                 hoverinfo="text",
                 pull=[0.0, 0.0, 0.0, 0.015],
@@ -94,7 +108,7 @@ def build_posture_donut_figure(
 
     fig.update_layout(
         height=height,
-        margin=dict(l=35, r=35, t=35, b=55),
+        margin=dict(l=42, r=42, t=56, b=58),
         paper_bgcolor=CARD_BG,
         plot_bgcolor=CARD_BG,
         font=dict(color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
@@ -102,7 +116,7 @@ def build_posture_donut_figure(
         legend=dict(
             orientation="h",
             yanchor="top",
-            y=-0.05,
+            y=-0.06,
             xanchor="center",
             x=0.5,
             font=dict(size=13, color="#CBD5E1"),
@@ -116,7 +130,7 @@ def build_posture_donut_figure(
 def build_utilization_donut_figure(
     kpis: Dict[str, Any],
     three_way_only: bool = False,
-    height: int = 410,
+    height: int = 420,
 ) -> go.Figure:
     """Build the Workstation Utilization Donut Chart (Working vs. Idle vs. Walking/Away)."""
     if three_way_only:
@@ -155,11 +169,12 @@ def build_utilization_donut_figure(
                 sort=False,
                 direction="clockwise",
                 rotation=0,
+                automargin=True,
                 marker=dict(colors=colors, line=dict(color=DARK_SLICE_BORDER, width=3)),
                 text=callout_text,
                 textinfo="text",
                 textposition="outside",
-                textfont=dict(size=14, color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
+                textfont=dict(size=13.5, color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
                 hovertext=hover_text,
                 hoverinfo="text",
             )
@@ -168,7 +183,7 @@ def build_utilization_donut_figure(
 
     fig.update_layout(
         height=height,
-        margin=dict(l=35, r=35, t=35, b=55),
+        margin=dict(l=42, r=42, t=56, b=58),
         paper_bgcolor=CARD_BG,
         plot_bgcolor=CARD_BG,
         font=dict(color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
@@ -176,7 +191,7 @@ def build_utilization_donut_figure(
         legend=dict(
             orientation="h",
             yanchor="top",
-            y=-0.05,
+            y=-0.06,
             xanchor="center",
             x=0.5,
             font=dict(size=13, color="#CBD5E1"),
@@ -235,19 +250,19 @@ def build_ergonomic_timeline_figure(
     include_activity_ribbon: bool = True,
     height: int = 300,
 ) -> go.Figure:
-    """Build an interactive Gantt / state-ribbon timeline tracking Posture (Sitting vs Standing vs Walking vs Away)
-    and Workstation Activity across elapsed video seconds.
-    """
+    """Build an interactive Gantt / state-ribbon timeline scaling dynamically to `1..N` employees."""
     posture_segs = extract_state_segments(df, state_col="posture_state")
     activity_segs = extract_state_segments(df, state_col="activity_state") if include_activity_ribbon else []
 
     fig = go.Figure()
     added_legend_states = set()
+    unique_lanes = set()
 
     def _add_segments(segs: List[Dict[str, Any]], lane_suffix: str, color_map: Dict[str, str]) -> None:
         for seg in segs:
             st = seg["state"]
             lane_name = f"{seg['track_label']} • {lane_suffix}"
+            unique_lanes.add(lane_name)
             color = color_map.get(st, "#475569")
             show_leg = st not in added_legend_states
             if show_leg:
@@ -281,10 +296,12 @@ def build_ergonomic_timeline_figure(
         _add_segments(activity_segs, "Activity", combined_colors)
     _add_segments(posture_segs, "Posture", combined_colors)
 
+    dyn_height = max(int(height), 48 * max(len(unique_lanes), 1) + 95)
+
     fig.update_layout(
         barmode="overlay",
-        height=height,
-        margin=dict(l=15, r=20, t=25, b=45),
+        height=dyn_height,
+        margin=dict(l=15, r=20, t=30, b=45),
         paper_bgcolor=CARD_BG,
         plot_bgcolor="rgba(15, 20, 30, 0.55)",
         font=dict(color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
@@ -298,12 +315,13 @@ def build_ergonomic_timeline_figure(
             title="",
             gridcolor="rgba(0,0,0,0)",
             color=TEXT_PRIMARY,
-            tickfont=dict(size=12.5),
+            tickfont=dict(size=12),
+            automargin=True,
         ),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.03,
+            y=1.02,
             xanchor="right",
             x=1.0,
             font=dict(size=12, color="#CBD5E1"),
@@ -316,58 +334,66 @@ def build_ergonomic_timeline_figure(
 def build_posture_elevation_figure(
     df: pl.DataFrame,
     thresholds: Optional[Dict[str, Any]] = None,
-    height: int = 270,
+    height: int = 295,
 ) -> go.Figure:
-    """Build a continuous ergonomic shoulder-elevation line chart vs calibrated Sitting/Standing cutoff."""
+    """Build a scale-invariant normalized shoulder-elevation `(H - Y) / H` chart across `1..N` employees."""
     fig = go.Figure()
     present = df.filter((pl.col("presence") == 1) & pl.col("track_id").is_not_null()).sort(
         ["track_id", "frame"]
     )
 
-    palette = ["#38BDF8", "#A78BFA", "#34D399", "#FBBF24"]
-    if not present.is_empty() and "shoulder_dist_bottom_px" in present.columns:
+    use_norm = "shoulder_dist_bottom_norm" in present.columns
+    y_col = "shoulder_dist_bottom_norm" if use_norm else "shoulder_dist_bottom_px"
+    y_axis_label = "Normalized Shoulder Height (H - Y) / H" if use_norm else "Vertical Distance (px)"
+
+    if not present.is_empty() and y_col in present.columns:
         for idx, (tid_tuple, grp) in enumerate(present.group_by(["track_id"], maintain_order=True)):
             tid = tid_tuple[0] if isinstance(tid_tuple, tuple) else tid_tuple
-            col = palette[idx % len(palette)]
+            col = EMPLOYEE_TRACE_PALETTE[idx % len(EMPLOYEE_TRACE_PALETTE)]
+            unit_fmt = "%{y:.3f} H" if use_norm else "%{y:.1f} px"
             fig.add_trace(
                 go.Scatter(
                     x=grp["timestamp_sec"].to_list(),
-                    y=grp["shoulder_dist_bottom_px"].to_list(),
+                    y=grp[y_col].to_list(),
                     mode="lines",
-                    name=f"Emp #{tid} Shoulder Height (H - Y)",
+                    name=f"Emp #{tid} Shoulder Elevation",
                     line=dict(color=col, width=2.0),
                     customdata=grp["posture_state"].to_list(),
                     hovertemplate=(
                         f"<b>Emp #{tid}</b> • %{{customdata}}<br>"
-                        "Time: %{x:.2f}s<br>Height from Bottom: %{y:.1f} px<extra></extra>"
+                        f"Time: %{{x:.2f}}s<br>Elevation: {unit_fmt}<extra></extra>"
                     ),
                 )
             )
 
-    thresh_px = None
+    thresh_val = None
     if thresholds:
         fg = thresholds.get("posture_zones", {}).get("foreground", {})
-        thresh_px = fg.get("threshold_px") or thresholds.get("global_posture_threshold_px")
+        if use_norm:
+            thresh_val = fg.get("threshold_norm") or thresholds.get("global_posture_threshold_norm")
+        else:
+            thresh_val = fg.get("threshold_px") or thresholds.get("global_posture_threshold_px")
 
-    if thresh_px is not None:
+    if thresh_val is not None:
+        lbl_str = f"{float(thresh_val):.3f} H" if use_norm else f"{float(thresh_val):.1f} px"
         fig.add_hline(
-            y=float(thresh_px),
+            y=float(thresh_val),
             line_dash="dash",
             line_color="#F43F5E",
             line_width=1.8,
-            annotation_text=f"Sitting ↔ Standing Cutoff ({float(thresh_px):.1f} px)",
+            annotation_text=f"Sitting ↔ Standing Cutoff ({lbl_str})",
             annotation_position="top right",
             annotation_font=dict(color="#FDA4AF", size=11.5),
         )
 
     fig.update_layout(
         height=height,
-        margin=dict(l=15, r=20, t=25, b=40),
+        margin=dict(l=15, r=20, t=30, b=40),
         paper_bgcolor=CARD_BG,
         plot_bgcolor="rgba(15, 20, 30, 0.55)",
         font=dict(color=TEXT_PRIMARY, family="Inter, -apple-system, sans-serif"),
         xaxis=dict(title="Video Timeline (Seconds)", gridcolor=GRID_SUBTLE, color=TEXT_MUTED),
-        yaxis=dict(title="Vertical Distance (px)", gridcolor=GRID_SUBTLE, color=TEXT_MUTED),
+        yaxis=dict(title=y_axis_label, gridcolor=GRID_SUBTLE, color=TEXT_MUTED),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
     )
     return fig
@@ -376,15 +402,23 @@ def build_posture_elevation_figure(
 def build_activity_heatmap_figure(
     df: pl.DataFrame,
     bin_seconds: float = 2.0,
+    velocity_threshold_sw_s: Optional[float] = None,
     velocity_threshold_px_s: Optional[float] = None,
-    height: int = 295,
+    height: int = 305,
 ) -> go.Figure:
-    """Build an interactive 2D Wrist Velocity Activity Heatmap highlighting active work bursts."""
+    """Build an interactive 2D Wrist Velocity Activity Heatmap (`SW/s`) scaling cleanly to `1..N` employees."""
     hm = build_velocity_heatmap_data(df, bin_seconds=bin_seconds)
+    unit = hm.get("unit", "SW/s")
 
     z_arr = np.array(hm["z_matrix"], dtype=np.float64)
-    z_cap = float(np.percentile(z_arr[z_arr > 0], 96.0)) if np.any(z_arr > 0) else 120.0
-    z_max = max(z_cap, (velocity_threshold_px_s or 32.0) * 2.5, 60.0)
+    if unit == "SW/s":
+        z_cap = float(np.percentile(z_arr[z_arr > 0], 96.0)) if np.any(z_arr > 0) else 0.8
+        ref_cut = velocity_threshold_sw_s if velocity_threshold_sw_s is not None else 0.25
+        z_max = max(z_cap, float(ref_cut) * 2.2, 0.45)
+        z_max_rounded = round(z_max, 2)
+    else:
+        z_cap = float(np.percentile(z_arr[z_arr > 0], 96.0)) if np.any(z_arr > 0) else 120.0
+        z_max_rounded = round(max(z_cap, (velocity_threshold_px_s or 32.0) * 2.5, 60.0), 1)
 
     colorscale = [
         [0.00, "#0D131F"],
@@ -394,6 +428,8 @@ def build_activity_heatmap_figure(
         [0.82, "#22D3EE"],
         [1.00, "#A5F3FC"],
     ]
+
+    dyn_height = max(int(height), 32 * max(len(hm["y_labels"]), 1) + 95)
 
     fig = go.Figure(
         data=[
@@ -405,11 +441,11 @@ def build_activity_heatmap_figure(
                 hoverinfo="text",
                 colorscale=colorscale,
                 zmin=0.0,
-                zmax=round(z_max, 1),
+                zmax=z_max_rounded,
                 xgap=1.5,
                 ygap=3.0,
                 colorbar=dict(
-                    title=dict(text="px/s", font=dict(color=TEXT_MUTED, size=11)),
+                    title=dict(text=unit, font=dict(color=TEXT_MUTED, size=11)),
                     tickfont=dict(color=TEXT_MUTED, size=11),
                     thickness=12,
                     len=0.88,
@@ -419,7 +455,7 @@ def build_activity_heatmap_figure(
     )
 
     fig.update_layout(
-        height=height,
+        height=dyn_height,
         margin=dict(l=15, r=20, t=20, b=45),
         paper_bgcolor=CARD_BG,
         plot_bgcolor="rgba(13, 19, 31, 0.85)",
@@ -434,6 +470,7 @@ def build_activity_heatmap_figure(
             gridcolor="rgba(0,0,0,0)",
             color=TEXT_PRIMARY,
             tickfont=dict(size=12),
+            automargin=True,
         ),
     )
     return fig

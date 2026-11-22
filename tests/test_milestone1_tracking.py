@@ -12,7 +12,7 @@ from src.config import (
     TELEMETRY_OUTPUT_DIR,
     VIDEOS_OUTPUT_DIR,
 )
-from src.tracking.landmarks import DetectionRaw, LandmarkPoint
+from src.tracking.landmarks import DetectionRaw, LandmarkPoint, is_plausible_human_pose
 from src.tracking.multi_tracker import PoseMultiTracker, compute_iou
 from src.tracking.pixel_motion import PixelMotionPoseAssister
 from src.tracking.pipeline import CSV_HEADER, CSV_ONLINE_BEHAVIOR_COLS, BatchTrackingPipeline, compute_acceleration_jitter
@@ -295,7 +295,83 @@ class TestMilestone1Tracking(unittest.TestCase):
             self.assertEqual(obs_hold[0].tracking_status, "tracked")
             self.assertAlmostEqual(obs_hold[0].wrist_pixel_motion_ratio or 0.0, 0.0, places=3)
 
+        # 3. Anti-ghost termination: if an unestablished static patch repeatedly fails pose verification,
+        # `lk_hold` must terminate within the anti-ghost budget rather than self-correlating for 900 frames!
+        for _ in range(25):
+            dets_ghost = assister2.augment_detections(static_frame, yolo_detections=[], active_tracks=tracker2.active_tracks)
+            obs_ghost = tracker2.update(dets_ghost, frame=static_frame)
+            assister2.attach_pixel_motion_metrics(obs_ghost, dets_ghost)
+        self.assertEqual(len(obs_ghost), 0, "Repeated pose rejections must terminate static ghost hold!")
         assister2.close()
+
+    def test_empty_chair_degenerate_poses_and_remote_dark_reid_rejected(self):
+        """Verify chair-like skeletons (vertical backrest shoulders, nose-on-shoulder collapse,
+        upside-down eyes) and 1-frame remote dark furniture Re-ID glitches are rejected.
+        """
+        w, h = 1920, 1080
+
+        def make_base_landmarks() -> dict:
+            lms = {jn: LandmarkPoint(jn, 960.0, 420.0, 0.85, 0.5, 420.0 / h) for jn in TARGET_LANDMARKS}
+            lms["nose"] = LandmarkPoint("nose", 960.0, 410.0, 0.88, 0.5, 410.0 / h)
+            lms["left_eye"] = LandmarkPoint("left_eye", 948.0, 398.0, 0.88, 948.0 / w, 398.0 / h)
+            lms["right_eye"] = LandmarkPoint("right_eye", 972.0, 398.0, 0.88, 972.0 / w, 398.0 / h)
+            lms["left_shoulder"] = LandmarkPoint("left_shoulder", 910.0, 480.0, 0.90, 910.0 / w, 480.0 / h)
+            lms["right_shoulder"] = LandmarkPoint("right_shoulder", 1010.0, 480.0, 0.90, 1010.0 / w, 480.0 / h)
+            lms["left_hip"] = LandmarkPoint("left_hip", 920.0, 650.0, 0.85, 920.0 / w, 650.0 / h)
+            lms["right_hip"] = LandmarkPoint("right_hip", 1000.0, 650.0, 0.85, 1000.0 / w, 650.0 / h)
+            return lms
+
+        bbox = (860.0, 360.0, 1060.0, 740.0)
+        self.assertTrue(is_plausible_human_pose(bbox, make_base_landmarks(), w, h))
+
+        # Case A: Vertically stacked chair-backrest "shoulders" (~89-deg tilt)
+        lms_vert = make_base_landmarks()
+        lms_vert["left_shoulder"] = LandmarkPoint("left_shoulder", 960.0, 460.0, 0.88, 0.5, 460.0 / h)
+        lms_vert["right_shoulder"] = LandmarkPoint("right_shoulder", 961.0, 560.0, 0.88, 961.0 / w, 560.0 / h)
+        self.assertFalse(is_plausible_human_pose(bbox, lms_vert, w, h))
+
+        # Case B: Upside-down eyes below nose
+        lms_inv = make_base_landmarks()
+        lms_inv["left_eye"] = LandmarkPoint("left_eye", 948.0, 425.0, 0.88, 948.0 / w, 425.0 / h)
+        lms_inv["right_eye"] = LandmarkPoint("right_eye", 972.0, 425.0, 0.88, 972.0 / w, 425.0 / h)
+        self.assertFalse(is_plausible_human_pose(bbox, lms_inv, w, h))
+
+        # Case C: Nose collapsed directly onto shoulder joint (swivel-chair armrest artifact)
+        lms_col = make_base_landmarks()
+        lms_col["nose"] = LandmarkPoint("nose", 912.0, 479.0, 0.75, 912.0 / w, 479.0 / h)
+        self.assertFalse(is_plausible_human_pose(bbox, lms_col, w, h))
+
+        # Case D: Single-frame dark armchair glitch across the room after a black-shirt employee exits -> 0 revival!
+        tracker = PoseMultiTracker(frame_width=1280, frame_height=720, fps=30.0, max_age_frames=15)
+        for _ in range(8):
+            frame = np.full((720, 1280, 3), 210, dtype=np.uint8)
+            frame[200:580, 100:260] = (22, 22, 22)
+            lms_emp = make_base_landmarks()
+            for jn in lms_emp:
+                lms_emp[jn] = LandmarkPoint(jn, 180.0, 260.0, 0.90, 180.0 / 1280.0, 260.0 / 720.0)
+            lms_emp["left_shoulder"] = LandmarkPoint("left_shoulder", 130.0, 260.0, 0.92, 130.0 / 1280.0, 260.0 / 720.0)
+            lms_emp["right_shoulder"] = LandmarkPoint("right_shoulder", 230.0, 260.0, 0.92, 230.0 / 1280.0, 260.0 / 720.0)
+            lms_emp["left_hip"] = LandmarkPoint("left_hip", 140.0, 440.0, 0.90, 140.0 / 1280.0, 440.0 / 720.0)
+            lms_emp["right_hip"] = LandmarkPoint("right_hip", 220.0, 440.0, 0.90, 220.0 / 1280.0, 440.0 / 720.0)
+            det_emp = DetectionRaw(bbox=(100.0, 200.0, 260.0, 580.0), bbox_conf=0.90, class_id=0, landmarks=lms_emp)
+            tracker.update([det_emp], frame=frame)
+
+        empty = np.full((720, 1280, 3), 210, dtype=np.uint8)
+        for _ in range(30):
+            tracker.update([], frame=empty)
+
+        # Transient 2-frame dark chair false candidate on opposite right side (x=980..1140)
+        chair_frame = np.full((720, 1280, 3), 210, dtype=np.uint8)
+        chair_frame[260:580, 980:1140] = (24, 24, 24)
+        lms_ch = dict(lms_emp)
+        lms_ch["left_shoulder"] = LandmarkPoint("left_shoulder", 1010.0, 320.0, 0.90, 1010.0 / 1280.0, 320.0 / 720.0)
+        lms_ch["right_shoulder"] = LandmarkPoint("right_shoulder", 1110.0, 320.0, 0.90, 1110.0 / 1280.0, 320.0 / 720.0)
+        lms_ch["left_hip"] = LandmarkPoint("left_hip", 1020.0, 480.0, 0.88, 1020.0 / 1280.0, 480.0 / 720.0)
+        lms_ch["right_hip"] = LandmarkPoint("right_hip", 1100.0, 480.0, 0.88, 1100.0 / 1280.0, 480.0 / 720.0)
+        det_chair = DetectionRaw(bbox=(980.0, 260.0, 1140.0, 580.0), bbox_conf=0.80, class_id=0, landmarks=lms_ch)
+        for _ in range(2):
+            obs_chair = tracker.update([det_chair], frame=chair_frame)
+            self.assertEqual(len(obs_chair), 0, "Transient remote dark chair must not revive departed black-shirt track!")
 
 
 if __name__ == "__main__":

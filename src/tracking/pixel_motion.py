@@ -121,8 +121,8 @@ class PixelMotionPoseAssister:
             self._mp_pose = mp.solutions.pose.Pose(
                 static_image_mode=True,
                 model_complexity=1,
-                enable_segmentation=False,
-                min_detection_confidence=0.40,
+                enable_segmentation=True,
+                min_detection_confidence=0.42,
             )
         return self._mp_pose
 
@@ -350,7 +350,41 @@ class PixelMotionPoseAssister:
         if not (0.01 <= ls_mp.y <= 0.98 and 0.01 <= rs_mp.y <= 0.98):
             return None
 
-        # 2. Head landmarks (frontal face OR back-turned ears/shoulders+hips) must sit anatomically above shoulders
+        # 2. Offline human foreground segmentation check (rejects empty chairs, monitors, and wall shadows)
+        seg_mask = getattr(res, "segmentation_mask", None)
+        torso_seg_mean = 1.0
+        max_sh_seg = 1.0
+        if seg_mask is not None and seg_mask.size > 0:
+            sh_h, sh_w_px = seg_mask.shape[:2]
+
+            def _sample_seg(nx: float, ny: float, r: int = 2) -> float:
+                ix = min(max(int(round(nx * (sh_w_px - 1))), 0), sh_w_px - 1)
+                iy = min(max(int(round(ny * (sh_h - 1))), 0), sh_h - 1)
+                patch = seg_mask[max(0, iy - r) : min(sh_h, iy + r + 1), max(0, ix - r) : min(sh_w_px, ix + r + 1)]
+                return float(np.mean(patch)) if patch.size > 0 else 0.0
+
+            max_sh_seg = max(_sample_seg(float(ls_mp.x), float(ls_mp.y)), _sample_seg(float(rs_mp.x), float(rs_mp.y)))
+            chest_nx = 0.5 * (float(ls_mp.x) + float(rs_mp.x))
+            chest_ny = 0.5 * (float(ls_mp.y) + float(rs_mp.y))
+            tx1_s = min(max(int(round(min(float(ls_mp.x), float(rs_mp.x)) * sh_w_px)), 0), sh_w_px - 1)
+            tx2_s = min(max(int(round(max(float(ls_mp.x), float(rs_mp.x)) * sh_w_px)) + 1, tx1_s + 1), sh_w_px)
+            span_s = max(tx2_s - tx1_s, int(round(0.08 * sh_w_px)), 4)
+            cx_s = min(max(int(round(chest_nx * sh_w_px)), 0), sh_w_px - 1)
+            rx1_s = max(0, cx_s - span_s // 2)
+            rx2_s = min(sh_w_px, cx_s + span_s // 2 + 1)
+            ry1_s = min(max(int(round(chest_ny * sh_h)), 0), sh_h - 1)
+            ry2_s = min(sh_h, ry1_s + max(int(round(0.22 * sh_h)), span_s, 4))
+            torso_patch_seg = seg_mask[ry1_s:ry2_s, rx1_s:rx2_s]
+            torso_seg_mean = float(np.mean(torso_patch_seg)) if torso_patch_seg.size > 0 else max_sh_seg
+
+            if source in ("mp_tile", "mp_motion"):
+                if max_sh_seg < 0.48 or torso_seg_mean < 0.28:
+                    return None
+            else:
+                if max_sh_seg < 0.32 or torso_seg_mean < 0.20:
+                    return None
+
+        # 3. Head landmarks (frontal face OR back-turned ears/shoulders+hips) must sit anatomically above shoulders
         head_indices = (0, 2, 5, 7, 8)
         best_head_vis = max(float(mp_lms[idx].visibility) for idx in head_indices)
         both_hips_strong = float(mp_lms[23].visibility) >= 0.58 and float(mp_lms[24].visibility) >= 0.58
@@ -432,7 +466,18 @@ class PixelMotionPoseAssister:
         if (bio_ref / fw) < 0.018 or (bio_ref / fw) > 0.48:
             return None
 
-        # Head must sit anatomically above/near shoulder line and horizontally aligned with torso
+        # Reject vertically stacked chair-backrest "shoulders" while allowing elevated side-profile employees
+        if abs(ls_pt.y - rs_pt.y) > max(1.15 * abs(ls_pt.x - rs_pt.x), 0.74 * bio_ref):
+            return None
+
+        # Head must sit anatomically above shoulder line with real neck separation and upright eye-nose ordering
+        nose_pt = landmarks_dict["nose"]
+        le_pt = landmarks_dict["left_eye"]
+        re_pt = landmarks_dict["right_eye"]
+        if nose_pt.conf >= 0.45 and le_pt.conf >= 0.45 and re_pt.conf >= 0.45:
+            if 0.5 * (le_pt.y + re_pt.y) > nose_pt.y + 0.03 * bio_ref:
+                return None
+
         head_min_c = 0.20 if back_view_valid else 0.48
         head_valid = [
             landmarks_dict[jn]
@@ -443,8 +488,16 @@ class PixelMotionPoseAssister:
             return None
         head_x = float(np.mean([p.x for p in head_valid]))
         head_y = float(np.mean([p.y for p in head_valid]))
-        if head_y > sh_mid_y + 0.22 * bio_ref or abs(head_x - sh_mid_x) > 1.45 * bio_ref:
+        if source == "mp_track":
+            # Active tracked employee may bow head straight down or rest head on forearms at desk
+            min_head_elev = -0.34 * bio_ref
+        else:
+            min_head_elev = -0.05 * bio_ref if back_view_valid else 0.14 * bio_ref
+        if (sh_mid_y - head_y) < min_head_elev or abs(head_x - sh_mid_x) > 1.45 * bio_ref:
             return None
+        if not back_view_valid and abs(ls_pt.x - rs_pt.x) >= 0.35 * bio_ref:
+            if min(float(np.hypot(head_x - ls_pt.x, head_y - ls_pt.y)), float(np.hypot(head_x - rs_pt.x, head_y - rs_pt.y))) < 0.20 * bio_ref:
+                return None
 
         if has_hips and hip_mid_y < sh_mid_y + 0.30 * bio_ref:
             return None
@@ -465,14 +518,39 @@ class PixelMotionPoseAssister:
         by1 = max(0.0, min(head_y - pad_top, min(vis_pts_y) - 0.25 * bio_ref))
         by2 = min(fh, max(max(vis_pts_y) + pad_bot, sh_mid_y + 1.45 * bio_ref))
 
+        # Reject mid-room floating hipless furniture skeletons unless strongly backed by human segmentation + high core conf
+        if source in ("mp_tile", "mp_motion") and by2 < 0.88 * fh and max(lh_pt.conf, rh_pt.conf) < 0.30:
+            if max_sh_seg < 0.55 or torso_seg_mean < 0.45 or core_conf < 0.70:
+                return None
+
         bbox = (bx1, by1, bx2, by2)
         if not is_plausible_human_pose(bbox, landmarks_dict, frame_width=self.frame_width, frame_height=self.frame_height):
             return None
 
         if require_motion_overlap:
-            step_frac = self._box_motion_fraction(bbox, use_step_only=True)
-            # Candidate at t > 0 must overlap genuine inter-frame pixel changes (never vacated-chair ghosts!)
-            if step_frac < 0.018:
+            # Measure pixel change strictly inside the detected upper-body + active-wrist core (excluding outer box padding)
+            core_xs = [ls_pt.x, rs_pt.x, head_x] + [
+                landmarks_dict[jn].x
+                for jn in ("left_elbow", "right_elbow", "left_wrist", "right_wrist")
+                if landmarks_dict[jn].conf >= 0.35
+            ]
+            core_ys = [ls_pt.y, rs_pt.y, head_y, min(fh, sh_mid_y + 0.95 * bio_ref)] + [
+                landmarks_dict[jn].y
+                for jn in ("left_elbow", "right_elbow", "left_wrist", "right_wrist")
+                if landmarks_dict[jn].conf >= 0.35
+            ]
+            c_pad = 0.15 * bio_ref
+            core_box = (
+                max(0.0, min(core_xs) - c_pad),
+                max(0.0, min(core_ys) - c_pad),
+                min(fw, max(core_xs) + c_pad),
+                min(fh, max(core_ys) + c_pad),
+            )
+            core_step_frac = max(
+                self._box_motion_fraction(core_box, use_step_only=True),
+                self._lk_patch_motion_fraction(core_box),
+            )
+            if core_step_frac < 0.022:
                 return None
 
         return DetectionRaw(
@@ -754,7 +832,9 @@ class PixelMotionPoseAssister:
             )
 
             mp_succeeded = False
+            mp_checked = False
             if should_run_mp and trk.time_since_update <= 15:
+                mp_checked = True
                 tbx1, tby1, tbx2, tby2 = trk.last_bbox
                 exp_trk_box = (
                     max(0.0, tbx1 - 0.55 * t_scale),
@@ -762,11 +842,6 @@ class PixelMotionPoseAssister:
                     min(fw, tbx2 + 0.55 * t_scale),
                     min(fh, tby2 + 0.55 * t_scale),
                 )
-                other_boxes = [
-                    other.last_bbox
-                    for other in active_tracks
-                    if other.track_id != tid and _box_iou_and_containment(trk.last_bbox, other.last_bbox)[0] < 0.35
-                ] + [d.bbox for d in merged]
                 cand_trk = self._detect_pose_in_crop(
                     frame_bgr,
                     exp_trk_box,
@@ -786,21 +861,35 @@ class PixelMotionPoseAssister:
                         mp_succeeded = True
 
             if mp_succeeded:
+                if anchor is not None:
+                    anchor["consecutive_mp_misses"] = 0
                 continue
 
-            # Stationary Torso Pixel Persistence + LK Optical Flow Hold
-            if anchor is not None and trk.hits >= 1 and trk.time_since_update <= 2:
+            if mp_checked and anchor is not None:
+                anchor["consecutive_mp_misses"] = int(anchor.get("consecutive_mp_misses", 0)) + 1
+
+            # Stationary Torso Pixel Persistence + LK Optical Flow Hold (confirmed tracks tid > 0 ONLY)
+            if tid > 0 and anchor is not None and trk.hits >= 1 and trk.time_since_update <= 2:
                 steps_since_verified = self.step_idx - int(anchor["last_pose_verified_step"])
+                verified_hits = int(anchor.get("verified_pose_hits", 0))
+                mp_misses = int(anchor.get("consecutive_mp_misses", 0))
                 curr_patch = self._extract_torso_gray_patch(self.curr_lk_gray, trk.last_bbox, trk.last_landmarks)
                 zncc_anchor = _zncc_patch(curr_patch, anchor.get("anchor_torso_patch"))
                 zncc_prev = _zncc_patch(curr_patch, anchor.get("prev_torso_patch"))
-                max_hold_steps = 900 if trk.hits >= 12 else 45
 
-                if not should_run_mp:
-                    can_hold = steps_since_verified <= max_hold_steps and zncc_prev >= 0.78 and zncc_anchor >= 0.72 and local_mot < 0.045
+                if verified_hits < 15:
+                    max_hold_steps = 18
+                    max_mp_misses = 1
                 else:
-                    # MP Pose missed (e.g., resting chin on hand / back turned while seated), hold while torso pixels remain in place
-                    can_hold = steps_since_verified <= max_hold_steps and zncc_anchor >= 0.75 and zncc_prev >= 0.80 and local_mot < 0.035
+                    max_hold_steps = 900
+                    max_mp_misses = 65
+
+                within_anti_ghost_budget = (steps_since_verified <= max_hold_steps) and (mp_misses <= max_mp_misses)
+                if not should_run_mp:
+                    can_hold = within_anti_ghost_budget and zncc_prev >= 0.78 and zncc_anchor >= 0.72 and local_mot < 0.045
+                else:
+                    # MP Pose missed (e.g., resting chin on hand / head bowed while seated): hold only within anti-ghost budget
+                    can_hold = within_anti_ghost_budget and zncc_anchor >= 0.76 and zncc_prev >= 0.80 and local_mot < 0.035
 
                 if can_hold:
                     lk_bbox, lk_lms, _ = self._propagate_landmarks_lk(trk.last_bbox, trk.last_landmarks, t_scale)
@@ -953,18 +1042,25 @@ class PixelMotionPoseAssister:
             bio_s = estimate_biological_scale(obs.bbox, obs.landmarks)
             curr_patch = self._extract_torso_gray_patch(self.curr_lk_gray, obs.bbox, obs.landmarks)
 
+            is_real_pose = obs.tracking_status == "tracked" and tid not in lk_hold_ids
             if tid not in self.track_anchors:
                 self.track_anchors[tid] = {
                     "anchor_torso_patch": curr_patch,
                     "prev_torso_patch": curr_patch,
                     "last_pose_verified_step": self.step_idx,
+                    "verified_pose_hits": 1 if is_real_pose else 0,
+                    "consecutive_mp_misses": 0,
                 }
             else:
-                self.track_anchors[tid]["prev_torso_patch"] = curr_patch
-                if obs.tracking_status == "tracked" and tid not in lk_hold_ids:
+                anc = self.track_anchors[tid]
+                anc["prev_torso_patch"] = curr_patch
+                if is_real_pose:
+                    gap = self.step_idx - int(anc.get("last_pose_verified_step", self.step_idx))
                     if curr_patch is not None:
-                        self.track_anchors[tid]["anchor_torso_patch"] = curr_patch
-                    self.track_anchors[tid]["last_pose_verified_step"] = self.step_idx
+                        anc["anchor_torso_patch"] = curr_patch
+                    anc["last_pose_verified_step"] = self.step_idx
+                    anc["consecutive_mp_misses"] = 0
+                    anc["verified_pose_hits"] = 1 if gap > 45 else (int(anc.get("verified_pose_hits", 0)) + 1)
 
             lms = obs.landmarks
             lw = lms["left_wrist"]

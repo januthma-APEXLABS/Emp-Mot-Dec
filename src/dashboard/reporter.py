@@ -89,7 +89,7 @@ def _draw_executive_hero_figure(df: pl.DataFrame, kpis: Dict[str, Any], title_te
         f"Frames: {kpis['unique_frames']:,}  |  "
         f"Video Duration: {format_duration_mmss(kpis['video_duration_sec'])}  |  "
         f"Employees Identified: {kpis['unique_employees']}{emp_ids_str}  |  "
-        f"Mean Wrist Speed: {kpis['mean_wrist_vel_px_s']:.1f} px/s"
+        f"Mean Wrist Speed: {kpis.get('mean_wrist_vel_sw_s', 0.0):.2f} SW/s"
     )
     ax_hdr.text(0.0, 0.08, sub_meta, fontsize=10.8, color=TEXT_SUB, va="center")
 
@@ -260,8 +260,10 @@ def _draw_executive_hero_figure(df: pl.DataFrame, kpis: Dict[str, Any], title_te
     ax_hm = fig.add_subplot(gs[3, :])
     _style_dark_card(ax_hm)
     hm = build_velocity_heatmap_data(df, bin_seconds=2.0)
+    hm_unit = hm.get("unit", "SW/s")
     z_mat = np.array(hm["z_matrix"], dtype=np.float64)
-    vmax = float(np.percentile(z_mat[z_mat > 0], 96.0)) if np.any(z_mat > 0) else 100.0
+    vmax = float(np.percentile(z_mat[z_mat > 0], 96.0)) if np.any(z_mat > 0) else (0.8 if hm_unit == "SW/s" else 100.0)
+    vmin_floor = 0.45 if hm_unit == "SW/s" else 50.0
     x_min_hm = hm["x_centers"][0] if hm["x_centers"] else 0.0
     x_max_hm = hm["x_centers"][-1] if hm["x_centers"] else 1.0
 
@@ -270,16 +272,16 @@ def _draw_executive_hero_figure(df: pl.DataFrame, kpis: Dict[str, Any], title_te
         aspect="auto",
         cmap="YlGnBu_r",
         vmin=0.0,
-        vmax=max(vmax, 50.0),
+        vmax=max(vmax, vmin_floor),
         extent=[x_min_hm, max(x_max_hm, x_min_hm + 1.0), -0.5, len(hm["y_labels"]) - 0.5],
         origin="lower",
     )
     ax_hm.set_yticks(list(range(len(hm["y_labels"]))))
-    ax_hm.set_yticklabels(hm["y_labels"], color=TEXT_MAIN, fontsize=9.5)
+    ax_hm.set_yticklabels(hm["y_labels"], color=TEXT_MAIN, fontsize=max(7.5, min(9.5, 90.0 / max(len(hm["y_labels"]), 1))))
     ax_hm.set_xlabel("Timeline (Seconds, 2.0s Bins)", color=TEXT_SUB, fontsize=10)
     ax_hm.tick_params(axis="x", colors=TEXT_SUB, labelsize=9.5)
     ax_hm.set_title(
-        "Wrist Velocity Activity Heatmap (30-Frame Rolling Speed, px/s)",
+        f"Wrist Velocity Activity Heatmap (30-Frame Rolling Speed, {hm_unit})",
         color=TEXT_MAIN,
         fontsize=12,
         fontweight="bold",
@@ -288,14 +290,16 @@ def _draw_executive_hero_figure(df: pl.DataFrame, kpis: Dict[str, Any], title_te
     )
     cbar = fig.colorbar(im, ax=ax_hm, fraction=0.018, pad=0.012)
     cbar.ax.tick_params(colors=TEXT_SUB, labelsize=8.5)
-    cbar.set_label("px/s", color=TEXT_SUB, fontsize=9)
+    cbar.set_label(hm_unit, color=TEXT_SUB, fontsize=9)
 
     return fig
 
 
 def _draw_summary_table_figure(summary_df: pl.DataFrame, thresholds: Dict[str, Any]) -> plt.Figure:
-    """Render Page 2 of the Executive PDF Report with the Per-Employee KPI Table & Threshold Audit."""
-    fig = plt.figure(figsize=(16.5, 9.0), facecolor=DARK_BG)
+    """Render Page 2 of the Executive PDF Report with the Per-Employee KPI Table (`1..N`) & Threshold Audit."""
+    n_data_rows = max(len(summary_df), 1)
+    fig_h = max(9.0, 4.6 + 0.55 * n_data_rows)
+    fig = plt.figure(figsize=(16.5, fig_h), facecolor=DARK_BG)
     ax = fig.add_axes([0.05, 0.08, 0.90, 0.84])
     ax.set_facecolor(DARK_BG)
     ax.axis("off")
@@ -308,13 +312,15 @@ def _draw_summary_table_figure(summary_df: pl.DataFrame, thresholds: Dict[str, A
         fontweight="bold",
         color=TEXT_MAIN,
     )
-    fg_t = thresholds.get("posture_zones", {}).get("foreground", {}).get("threshold_px", 457.94)
-    vel_t = thresholds.get("wrist_velocity_threshold_px_s", 32.01)
+    fg_t = thresholds.get("posture_zones", {}).get("foreground", {}).get(
+        "threshold_norm", thresholds.get("global_posture_threshold_norm", 0.45)
+    )
+    vel_t = thresholds.get("wrist_velocity_threshold_sw_s", 0.25)
     ax.text(
         0.0,
         0.89,
-        f"Calibrated Cutoffs  •  Foreground Sitting/Standing: {fg_t:.2f} px  |  "
-        f"Rolling 30f Wrist Velocity: {vel_t:.2f} px/s  |  Idle Confirmation Dwell: 5.0s",
+        f"Scale-Invariant Calibrated Cutoffs  •  Sitting/Standing Ratio ((H - Y)/H): {float(fg_t):.3f} H  |  "
+        f"Rolling 30f Wrist Speed: {float(vel_t):.3f} SW/s  |  Debounced Dwell: 15 frames",
         fontsize=11,
         color=TEXT_SUB,
     )
@@ -328,11 +334,12 @@ def _draw_summary_table_figure(summary_df: pl.DataFrame, thresholds: Dict[str, A
         "Standing %",
         "Walking %",
         "Away %",
-        "Mean Wrist (px/s)",
+        "Mean Wrist (SW/s)",
         "Transitions",
     ]
     cell_rows = []
     for row in summary_df.iter_rows(named=True):
+        mean_sw_val = row.get("Mean_Wrist_Speed_SW_s", row.get("Mean_Wrist_Speed_px_s", 0.0))
         cell_rows.append(
             [
                 row["Scope"],
@@ -343,20 +350,22 @@ def _draw_summary_table_figure(summary_df: pl.DataFrame, thresholds: Dict[str, A
                 f"{row['Standing_Pct']:.1f}%",
                 f"{row['Walking_Pct']:.1f}%",
                 f"{row['Away_Pct']:.1f}%",
-                f"{row['Mean_Wrist_Speed_px_s']:.1f}",
+                f"{float(mean_sw_val):.2f}",
                 str(row["Posture_Transitions"]),
             ]
         )
 
+    tbl_height = min(0.62, max(0.32, 0.075 * (len(cell_rows) + 1)))
+    tbl_bottom = max(0.22, 0.82 - tbl_height)
     tbl = ax.table(
         cellText=cell_rows,
         colLabels=col_headers,
         loc="center",
         cellLoc="center",
-        bbox=[0.0, 0.35, 1.0, 0.44],
+        bbox=[0.0, tbl_bottom, 1.0, tbl_height],
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10.5)
+    tbl.set_fontsize(max(8.5, min(10.5, 95.0 / max(len(cell_rows) + 2, 1))))
 
     for (r_idx, c_idx), cell in tbl.get_celld().items():
         cell.set_edgecolor(CARD_BORDER)

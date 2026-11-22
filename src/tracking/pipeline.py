@@ -76,6 +76,78 @@ def compute_acceleration_jitter(coords: np.ndarray) -> float:
     return float(np.mean(dists))
 
 
+def record_played_stream(telemetry_dir: Path, video_name: str) -> None:
+    """Record or update `video_name` in `played_streams.json` without removing previously played streams."""
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = telemetry_dir / "played_streams.json"
+    entries: List[Dict[str, object]] = []
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                entries = [e for e in loaded if isinstance(e, dict) and e.get("video_name") != video_name]
+        except Exception:
+            entries = []
+    entries.append({"video_name": video_name, "played_at": round(time.time(), 3)})
+    tmp_path = manifest_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(entries, f, indent=2)
+    tmp_path.replace(manifest_path)
+
+
+def _upsert_csv_by_video_name(
+    master_csv_path: Path,
+    header: List[str],
+    new_rows: List[list],
+    updated_videos: set,
+) -> int:
+    """Upsert `new_rows` into `master_csv_path` by `video_name` (col 0), preserving all prior streams."""
+    master_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    preserved_rows: List[list] = []
+    if master_csv_path.exists():
+        try:
+            with open(master_csv_path, mode="r", newline="") as f:
+                reader = csv.reader(f)
+                existing_hdr = next(reader, None)
+                if existing_hdr == header:
+                    for row in reader:
+                        if row and row[0] not in updated_videos:
+                            preserved_rows.append(row)
+        except Exception:
+            preserved_rows = []
+
+    combined = preserved_rows + new_rows
+    tmp_path = master_csv_path.with_suffix(".csv.tmp")
+    with open(tmp_path, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(combined)
+    tmp_path.replace(master_csv_path)
+    return len(combined)
+
+
+def _upsert_validation_summary(summary_path: Path, new_stats: List[Dict]) -> List[Dict]:
+    """Upsert per-video validation stats by `video_name` without losing previously played videos."""
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    updated_names = {s.get("video_name") for s in new_stats}
+    preserved: List[Dict] = []
+    if summary_path.exists():
+        try:
+            with open(summary_path, "r") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                preserved = [s for s in loaded if isinstance(s, dict) and s.get("video_name") not in updated_names]
+        except Exception:
+            preserved = []
+    merged = preserved + list(new_stats)
+    tmp_path = summary_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(merged, f, indent=2)
+    tmp_path.replace(summary_path)
+    return merged
+
+
 class BatchTrackingPipeline:
     """Executes multi-person `model.track(persist=True)` ByteTrack + Re-ID tracking,
     online `deque(maxlen=30)` scale-invariant classification, video rendering, and CSV export.
@@ -439,10 +511,21 @@ class BatchTrackingPipeline:
 
         rows_to_write = cleaned_rows
 
-        with open(out_csv_path, mode="w", newline="") as f:
+        tmp_csv_path = out_csv_path.with_suffix(".csv.tmp")
+        with open(tmp_csv_path, mode="w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(CSV_HEADER)
             writer.writerows(rows_to_write)
+        tmp_csv_path.replace(out_csv_path)
+
+        record_played_stream(target_telemetry_dir, video_name)
+        if output_telemetry_dir is None and max_frames is None:
+            _upsert_csv_by_video_name(
+                target_telemetry_dir / "batch_landmarks.csv",
+                CSV_HEADER,
+                rows_to_write,
+                {video_name},
+            )
 
         print(f"Saved telemetry to: {out_csv_path} ({len(rows_to_write)} rows)")
         if save_video:
@@ -526,15 +609,17 @@ class BatchTrackingPipeline:
                     all_csv_rows.append(row)
 
         master_csv_path = TELEMETRY_OUTPUT_DIR / "batch_landmarks.csv"
-        with open(master_csv_path, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADER)
-            writer.writerows(all_csv_rows)
-        print(f"Master batch telemetry saved to: {master_csv_path} ({len(all_csv_rows)} rows)")
+        updated_videos = {s["video_name"] for s in batch_stats}
+        total_master_rows = _upsert_csv_by_video_name(
+            master_csv_path,
+            CSV_HEADER,
+            all_csv_rows,
+            updated_videos,
+        )
+        print(f"Master batch telemetry saved to: {master_csv_path} ({total_master_rows} rows across all played videos)")
 
         summary_path = TELEMETRY_OUTPUT_DIR / "milestone1_validation_summary.json"
-        with open(summary_path, mode="w") as f:
-            json.dump(batch_stats, f, indent=2)
+        _upsert_validation_summary(summary_path, batch_stats)
         print(f"Milestone 1 validation summary saved to: {summary_path}")
 
         self.generate_jitter_plot()

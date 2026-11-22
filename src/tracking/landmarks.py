@@ -137,10 +137,30 @@ def is_plausible_human_pose(
         return False
 
     bio_scale = estimate_biological_scale(bbox, landmarks)
-    nose = landmarks.get("nose")
-    if nose and nose.conf > 0.30 and (ls.conf > 0.25 or rs.conf > 0.25):
-        if nose.y > sh_y + 0.28 * bio_scale:
+
+    # Reject vertically stacked non-human "shoulders" hallucinated along chair backrests or doorframes
+    # while permitting elevated-camera 90-deg side-profile employees (where spine_l anchors bio_scale)
+    if ls.conf >= 0.30 and rs.conf >= 0.30:
+        if abs(ls.y - rs.y) > max(1.15 * abs(ls.x - rs.x), 0.74 * bio_scale):
             return False
+
+    nose = landmarks.get("nose")
+    le = landmarks.get("left_eye")
+    re = landmarks.get("right_eye")
+    if nose and le and re and nose.conf >= 0.45 and le.conf >= 0.45 and re.conf >= 0.45:
+        if 0.5 * (le.y + re.y) > nose.y + 0.03 * bio_scale:
+            return False
+
+    if nose and nose.conf > 0.30 and (ls.conf > 0.25 or rs.conf > 0.25):
+        if nose.y > sh_y + 0.34 * bio_scale:
+            return False
+        # Reject swivel-chair armrest artifacts where nose collapses onto a shoulder joint
+        # (while permitting frontal head-bowed / head-on-arms desk posture centered between shoulders)
+        if nose.conf >= 0.42 and ls.conf >= 0.30 and rs.conf >= 0.30 and abs(ls.x - rs.x) >= 0.35 * bio_scale:
+            d_ls = float(np.hypot(nose.x - ls.x, nose.y - ls.y))
+            d_rs = float(np.hypot(nose.x - rs.x, nose.y - rs.y))
+            if min(d_ls, d_rs) < 0.20 * bio_scale:
+                return False
 
     lh = landmarks.get("left_hip")
     rh = landmarks.get("right_hip")

@@ -1,4 +1,5 @@
-Scope,Active_Seconds,Duration_Formatted,Working_Pct,Idle_Pct,Sitting_Pct,Standing_Pct,Walking_Pct,Away_Pct,Mean_Wrist_Speed_px_s,Peak_Wrist_Speed_px_s,Posture_Transitions
-All Observations (Aggregate),178.47,2m 58.5s,68.8,19.2,67.5,20.5,8.9,3.1,202.77,1273.14,24
-Emp #1,122.1,2m 02.1s,72.4,10.9,77.5,5.7,9.3,7.5,180.31,732.31,15
-Emp #2,50.77,50.8s,20.6,15.1,13.7,22.0,2.8,61.5,256.79,1632.79,9
+Scope,Active_Seconds,Duration_Formatted,Working_Pct,Idle_Pct,Sitting_Pct,Standing_Pct,Walking_Pct,Away_Pct,Mean_Wrist_Speed_SW_s,Peak_Wrist_Speed_SW_s,Posture_Transitions
+All Observations (Aggregate),1155.77,19m 15.8s,66.7,16.0,72.1,10.6,6.9,10.4,2.164,13.074,190
+Emp #1,941.63,15m 41.6s,65.2,15.7,72.9,8.0,6.0,13.1,2.124,14.038,144
+Emp #2,192.33,3m 12.3s,13.3,2.6,12.6,3.3,1.8,82.2,2.253,8.123,44
+Emp #3,24.43,24.4s,0.9,0.8,0.4,1.3,0.3,98.0,3.135,11.079,2

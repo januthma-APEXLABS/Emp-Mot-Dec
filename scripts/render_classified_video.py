@@ -101,6 +101,10 @@ def main() -> None:
 
     save_verification_grid(
         video_path=out_vid,
+        out_plot_path=PLOTS_OUTPUT_DIR / f"{vid_path.stem}_verification.png",
+    )
+    save_verification_grid(
+        video_path=out_vid,
         out_plot_path=PLOTS_OUTPUT_DIR / "reid_6class_verification.png",
     )
 

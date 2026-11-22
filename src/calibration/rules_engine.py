@@ -490,10 +490,10 @@ def generate_state_timeline_plot(
         return out_path
 
     top_tracks = (
-        present.group_by("track_id")
-        .len()
-        .sort("len", descending=True)
-        .head(4)["track_id"]
+        present["track_id"]
+        .drop_nulls()
+        .unique()
+        .sort()
         .to_list()
     )
 
@@ -680,6 +680,8 @@ def run_milestone2_pipeline(
             min_dwell_frames=min_dwell_frames,
             enable_perspective_zones=enable_perspective_zones,
         )
+        for v_name in video_names:
+            thresholds.save_json(output_telemetry_dir / f"{Path(v_name).stem}_thresholds.json")
         engine = BehaviorRulesEngine(thresholds=thresholds)
         classified_df, classification_metrics = engine.classify_dataframe(feature_df)
 
@@ -687,14 +689,31 @@ def run_milestone2_pipeline(
     thresholds.save_json(thresholds_path)
 
     temporal_csv_path = output_telemetry_dir / "temporal_features.csv"
-    classified_df.write_csv(temporal_csv_path, float_precision=4)
+    merged_temporal_df = classified_df
+    if temporal_csv_path.exists() and video_names:
+        try:
+            existing_temporal = pl.read_csv(temporal_csv_path, infer_schema_length=25000)
+            if "video_name" in existing_temporal.columns:
+                kept_prior = existing_temporal.filter(~pl.col("video_name").is_in(video_names))
+                if not kept_prior.is_empty():
+                    merged_temporal_df = pl.concat(
+                        [kept_prior, classified_df], how="diagonal_relaxed"
+                    ).sort(["video_name", "frame", "track_id"], nulls_last=True)
+        except Exception:
+            merged_temporal_df = classified_df
+
+    tmp_temporal = temporal_csv_path.with_suffix(".csv.tmp")
+    merged_temporal_df.write_csv(tmp_temporal, float_precision=4)
+    tmp_temporal.replace(temporal_csv_path)
 
     per_video_paths: List[str] = []
     for vid_tuple, v_df in classified_df.group_by("video_name", maintain_order=True):
         vid_name = str(vid_tuple[0])
         vid_stem = Path(vid_name).stem
         v_out = output_telemetry_dir / f"{vid_stem}_classified.csv"
-        v_df.write_csv(v_out, float_precision=4)
+        v_tmp = v_out.with_suffix(".csv.tmp")
+        v_df.write_csv(v_tmp, float_precision=4)
+        v_tmp.replace(v_out)
         per_video_paths.append(str(v_out))
 
     plot_paths = generate_calibration_plots(

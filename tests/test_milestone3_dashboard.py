@@ -8,11 +8,15 @@ import polars as pl
 import src.config  # noqa: F401
 from src.config import PROJECT_ROOT, TELEMETRY_OUTPUT_DIR
 from src.dashboard.data_loader import (
+    build_employee_detail_profiles,
     build_employee_summary_table,
     build_velocity_heatmap_data,
     compute_dashboard_kpis,
     extract_state_segments,
     filter_telemetry,
+    get_available_employees,
+    get_available_videos,
+    load_all_played_telemetry,
     load_calibrated_thresholds,
     load_telemetry_dataframe,
 )
@@ -129,12 +133,97 @@ class TestMilestone3Dashboard(unittest.TestCase):
             self.assertEqual(len(tbl), expected_rows)
 
     def test_streamlit_app_headless_render(self):
-        """Execute `app.py` via Streamlit's native `AppTest` harness and verify zero runtime exceptions."""
+        """Execute `app.py` via Streamlit's native `AppTest` harness across multi-video & 3-employee streams."""
         from streamlit.testing.v1 import AppTest
 
         at = AppTest.from_file(str(PROJECT_ROOT / "app.py"), default_timeout=20)
         at.run()
         self.assertEqual(len(at.exception), 0, f"Streamlit app raised exception: {at.exception}")
+
+        # Verify all played streams appear in 'Video Stream' selectbox (not just the last-played video!)
+        vid_select = at.sidebar.selectbox(key="video_stream_selectbox")
+        self.assertGreaterEqual(len(vid_select.options), 6, f"Expected all 6 played videos, got: {vid_select.options}")
+        self.assertIn("Input_3.mp4", vid_select.options)
+        self.assertIn("Input_6.mp4", vid_select.options)
+
+        # Select 3-employee open-office stream `Input_3.mp4` and verify >2 employees in Employee Filter + Details!
+        vid_select.select("Input_3.mp4").run()
+        self.assertEqual(len(at.exception), 0, f"Switching to Input_3.mp4 failed: {at.exception}")
+        emp_select = at.sidebar.selectbox(key="emp_filter_choice_Input_3.mp4")
+        self.assertEqual(
+            emp_select.options,
+            ["All Employees (Overview)", "Emp #1", "Emp #2", "Emp #3"],
+        )
+
+        # Select Emp #3 specifically and verify detailed view renders cleanly with 0 exceptions
+        emp_select.select("Emp #3").run()
+        self.assertEqual(len(at.exception), 0, f"Selecting Emp #3 raised exception: {at.exception}")
+
+    def test_cumulative_video_stream_discovery_and_4plus_employee_details(self):
+        """Verify sequential single-video playback adds every stream immediately (including raw landmarks)
+        and supports >2 employees (`Emp #1` .. `Emp #4`) in Employee Filter & detail profiles.
+        """
+        from src.calibration.rules_engine import run_milestone2_pipeline
+        from src.tracking.pipeline import CSV_HEADER, record_played_stream
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            t_dir = Path(tmp_dir) / "telemetry"
+            p_dir = Path(tmp_dir) / "plots"
+            t_dir.mkdir(parents=True, exist_ok=True)
+            p_dir.mkdir(parents=True, exist_ok=True)
+
+            def _write_mock_landmarks(vid_name: str, num_employees: int) -> Path:
+                stem = Path(vid_name).stem
+                out_csv = t_dir / f"{stem}_landmarks.csv"
+                rows = []
+                for f_idx in range(1, 36):
+                    t_sec = round((f_idx - 1) / 30.0, 4)
+                    for eid in range(1, num_employees + 1):
+                        sx = 200.0 * eid
+                        sy = 420.0
+                        kpts = []
+                        for _ in range(13):
+                            kpts.extend([sx, sy, 0.92])
+                        row = (
+                            [vid_name, f_idx, t_sec, 30.0, 1920, 1080, 1, eid, eid, "tracked", sx - 60, 300.0, sx + 60, 720.0, 0.92]
+                            + kpts
+                            + ["Sitting", "Working", "Sitting | Working", 0.45, 0.04, 0.02, 0.05, 0.42]
+                        )
+                        rows.append(row)
+                import csv
+                with open(out_csv, "w", newline="") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(CSV_HEADER)
+                    writer.writerows(rows)
+                record_played_stream(t_dir, vid_name)
+                return out_csv
+
+            # 1. Play Stream_A (2 employees) + run Milestone 2
+            csv_a = _write_mock_landmarks("Stream_A.mp4", num_employees=2)
+            run_milestone2_pipeline(input_csv_path=csv_a, output_telemetry_dir=t_dir, output_plots_dir=p_dir)
+
+            # 2. Play Stream_B (4 employees) + run Milestone 2 (single-video call MUST NOT erase Stream_A!)
+            csv_b = _write_mock_landmarks("Stream_B.mp4", num_employees=4)
+            run_milestone2_pipeline(input_csv_path=csv_b, output_telemetry_dir=t_dir, output_plots_dir=p_dir)
+
+            # 3. Play Stream_C (3 employees) in Milestone 1 ONLY (before Milestone 2 runs!)
+            _write_mock_landmarks("Stream_C.mp4", num_employees=3)
+
+            merged = load_all_played_telemetry(t_dir)
+            streams = get_available_videos(merged, telemetry_dir=t_dir)
+            self.assertEqual(streams, ["Stream_A.mp4", "Stream_B.mp4", "Stream_C.mp4"])
+
+            # Verify temporal_features.csv itself retained both Stream_A and Stream_B via upsert
+            tf_only = pl.read_csv(t_dir / "temporal_features.csv")
+            self.assertEqual(sorted(tf_only["video_name"].unique().to_list()), ["Stream_A.mp4", "Stream_B.mp4"])
+
+            # Verify 4-employee details on Stream_B
+            emps_b = get_available_employees(merged, video_name="Stream_B.mp4")
+            self.assertEqual(emps_b, [1, 2, 3, 4])
+            profiles_b = build_employee_detail_profiles(merged, video_name="Stream_B.mp4")
+            self.assertEqual([p["label"] for p in profiles_b], ["Emp #1", "Emp #2", "Emp #3", "Emp #4"])
+            summary_b = build_employee_summary_table(merged.filter(pl.col("video_name") == "Stream_B.mp4"))
+            self.assertEqual(len(summary_b), 5)
 
 
 if __name__ == "__main__":

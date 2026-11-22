@@ -45,11 +45,11 @@ def compute_iou(box_a: Tuple[float, float, float, float], box_b: Tuple[float, fl
     return inter_area / union_area
 
 
-def extract_torso_appearance_embedding(
+def _extract_torso_patch_bgr(
     frame_bgr: Optional[np.ndarray],
     det: DetectionRaw,
 ) -> Optional[np.ndarray]:
-    """Extract L2-normalized illumination-resilient HSV + CIE-Lab torso color histogram."""
+    """Extract a normalized 32x48 BGR torso patch if cleanly inside the frame."""
     if frame_bgr is None or frame_bgr.size == 0:
         return None
 
@@ -95,7 +95,18 @@ def extract_torso_appearance_embedding(
     if (tx2 - tx1) < max(int(0.012 * w), 2) or (ty2 - ty1) < max(int(0.015 * h), 2):
         return None
 
-    patch = cv2.resize(frame_bgr[ty1:ty2, tx1:tx2], (32, 48), interpolation=cv2.INTER_AREA)
+    return cv2.resize(frame_bgr[ty1:ty2, tx1:tx2], (32, 48), interpolation=cv2.INTER_AREA)
+
+
+def extract_torso_appearance_embedding(
+    frame_bgr: Optional[np.ndarray],
+    det: DetectionRaw,
+) -> Optional[np.ndarray]:
+    """Extract L2-normalized illumination-resilient HSV + CIE-Lab torso color histogram."""
+    patch = _extract_torso_patch_bgr(frame_bgr, det)
+    if patch is None:
+        return None
+
     hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
 
@@ -109,12 +120,25 @@ def extract_torso_appearance_embedding(
     return vec / norm
 
 
+def _extract_torso_saturation(
+    frame_bgr: Optional[np.ndarray],
+    det: DetectionRaw,
+) -> Optional[float]:
+    """Mean HSV saturation in [0, 1] of the torso patch (distinguishes chromatic shirts from black/gray furniture)."""
+    patch = _extract_torso_patch_bgr(frame_bgr, det)
+    if patch is None:
+        return None
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    return float(np.mean(hsv[:, :, 1])) / 255.0
+
+
 @dataclass
 class EmployeeGalleryProfile:
     """Persistent appearance & normalized spatial memory for an identified employee across occlusions."""
     track_id: int
     ema_embedding: Optional[np.ndarray] = None
     exemplars: List[np.ndarray] = field(default_factory=list)
+    mean_sat: Optional[float] = None
     last_bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     last_bio_scale: float = 1.0
     last_raw_bt_id: Optional[int] = None
@@ -129,6 +153,7 @@ class EmployeeGalleryProfile:
         step: int,
         conf: float,
         raw_bt_id: Optional[int] = None,
+        sat: Optional[float] = None,
     ) -> None:
         self.last_bbox = bbox
         self.last_bio_scale = max(bio_scale, 1e-3)
@@ -138,6 +163,9 @@ class EmployeeGalleryProfile:
         self.total_hits += 1
         if emb is None or conf < 0.50:
             return
+
+        if sat is not None:
+            self.mean_sat = sat if self.mean_sat is None else (0.88 * self.mean_sat + 0.12 * sat)
 
         if self.ema_embedding is None:
             self.ema_embedding = emb.copy()
@@ -375,6 +403,7 @@ class PoseMultiTracker:
         det: DetectionRaw,
         emb: Optional[np.ndarray],
         excluded_ids: set,
+        det_sat: Optional[float] = None,
     ) -> Optional[int]:
         if not self.gallery:
             return None
@@ -418,8 +447,14 @@ class PoseMultiTracker:
                 continue
 
             if emb is not None and prof.ema_embedding is not None:
+                both_achromatic = (
+                    det_sat is not None
+                    and prof.mean_sat is not None
+                    and max(det_sat, prof.mean_sat) < 0.18
+                )
+                min_global_sim = 0.84 if (both_achromatic and dist_diag_norm > 0.25) else 0.72
                 if (
-                    app_sim >= 0.72
+                    app_sim >= min_global_sim
                     or (frames_absent <= 120 and dist_sw <= 2.6 and app_sim >= 0.62)
                     or (frames_absent <= 750 and dist_sw <= 1.65 and app_sim >= 0.54)
                 ):
@@ -448,6 +483,9 @@ class PoseMultiTracker:
 
         det_embeddings: List[Optional[np.ndarray]] = [
             extract_torso_appearance_embedding(frame, det) for det in detections
+        ]
+        det_sats: List[Optional[float]] = [
+            _extract_torso_saturation(frame, det) for det in detections
         ]
         det_scales: List[float] = [
             estimate_biological_scale(det.bbox, det.landmarks) for det in detections
@@ -562,6 +600,7 @@ class PoseMultiTracker:
                             self.step_idx,
                             det.bbox_conf,
                             raw_bt_id=det.raw_track_id,
+                            sat=det_sats[c] if emb_to_store is not None else None,
                         )
 
         for r, trk in enumerate(track_list):
@@ -578,9 +617,16 @@ class PoseMultiTracker:
             if det.source == "lk_hold":
                 continue
             emb = det_embeddings[c]
+            det_sat = det_sats[c]
 
-            reid_tid = self._match_gallery_reid(det, emb, excluded_ids=occupied_ids)
-            if reid_tid is not None:
+            reid_tid = self._match_gallery_reid(det, emb, excluded_ids=occupied_ids, det_sat=det_sat)
+            # Only reconnect on a single frame if the track is still actively coasting (`reid_tid in self.tracks_by_id`)
+            # OR if `frame is None` (synthetic geometry-only mode). Expired tracks (`> max_age_frames` absent) must pass
+            # probationary confirmation first so a 1-frame empty-chair glitch never revives a departed employee's ID!
+            can_immediate_reid = reid_tid is not None and (
+                reid_tid in self.tracks_by_id or frame is None or self.step_idx <= 1
+            )
+            if can_immediate_reid and reid_tid is not None:
                 occupied_ids.add(reid_tid)
                 if reid_tid in self.tracks_by_id:
                     existing_trk = self.tracks_by_id[reid_tid]
@@ -594,7 +640,6 @@ class PoseMultiTracker:
                         smoother_type=self.smoother_type,
                         dt=1.0 / max(self.fps, 1.0),
                     )
-                    revived_track.hits = self.gallery[reid_tid].total_hits + 1
                     self.tracks_by_id[reid_tid] = revived_track
                 emb_to_store = emb if self._is_clean_isolated_detection(c, detections) else None
                 self.gallery[reid_tid].update_appearance(
@@ -604,6 +649,7 @@ class PoseMultiTracker:
                     self.step_idx,
                     det.bbox_conf,
                     raw_bt_id=det.raw_track_id,
+                    sat=det_sat if emb_to_store is not None else None,
                 )
             elif det.bbox_conf >= self.new_track_min_conf:
                 fw_f = max(float(self.frame_width), 1.0)
@@ -620,7 +666,7 @@ class PoseMultiTracker:
                 # Wait until torso enters frame enough to extract appearance before spawning a new ID
                 if is_edge_sliver or (frame is not None and emb is None and has_established_gallery):
                     continue
-                # Allocate temporary negative ID on frame > 1 when `frame` is present; promote to permanent ID on 2nd hit!
+                # Allocate temporary negative ID on frame > 1 when `frame` is present; promote once confirmed!
                 use_probation = frame is not None and self.step_idx > 1
                 if use_probation:
                     alloc_tid = self._next_temp_id
@@ -648,6 +694,7 @@ class PoseMultiTracker:
                         self.step_idx,
                         det.bbox_conf,
                         raw_bt_id=det.raw_track_id,
+                        sat=det_sat if emb_to_store is not None else None,
                     )
 
         # Promote probationary tracks once confirmed (`hits >= req_hits`), matching gallery first before minting a new ID!
@@ -665,13 +712,13 @@ class PoseMultiTracker:
                     raw_track_id=p_trk.last_raw_bt_id,
                 )
                 p_emb = extract_torso_appearance_embedding(frame, p_det)
+                p_sat = _extract_torso_saturation(frame, p_det)
                 p_scale = estimate_biological_scale(p_det.bbox, p_det.landmarks)
                 # Exclude ONLY tracks updated on this current step (`time_since_update == 0`)
                 active_matched_ids = {k for k, v in self.tracks_by_id.items() if k > 0 and v.time_since_update == 0}
-                reid_match = self._match_gallery_reid(p_det, p_emb, excluded_ids=active_matched_ids)
+                reid_match = self._match_gallery_reid(p_det, p_emb, excluded_ids=active_matched_ids, det_sat=p_sat)
                 if reid_match is not None:
                     perm_id = reid_match
-                    p_trk.hits += self.gallery[perm_id].total_hits
                 else:
                     perm_id = self.next_track_id
                     self.next_track_id += 1
@@ -686,6 +733,7 @@ class PoseMultiTracker:
                     self.step_idx,
                     p_det.bbox_conf,
                     raw_bt_id=p_det.raw_track_id,
+                    sat=p_sat if p_emb is not None else None,
                 )
 
         # Deferred gallery merge: if a newer track reveals a torso matching an un-matched veteran ID, merge!
