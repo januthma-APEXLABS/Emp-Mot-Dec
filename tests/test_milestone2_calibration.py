@@ -495,14 +495,102 @@ class TestMilestone2Calibration(unittest.TestCase):
             out_df = pl.read_csv(summary["temporal_features_csv_path"], infer_schema_length=15000)
             self.assertEqual(len(out_df), summary["classification_metrics"]["total_rows"])
             for col in (
-                "shoulder_dist_bottom_px",
-                "rolling_30f_wrist_vel_px_s",
+                "Track_ID",
+                "shoulder_dist_bottom_norm",
+                "rolling_30f_wrist_vel_sw_s",
                 "presence_state",
                 "posture_state",
                 "activity_state",
                 "motion_state",
             ):
                 self.assertIn(col, out_df.columns)
+
+    def test_camera_scale_invariance_and_multi_employee_deques(self):
+        """Verify scale-invariant math produces identical SW/s velocities and identical labels
+        across near (1920x1080) vs far (640x360, 3x smaller pixels!) cameras, while isolating
+        multiple simultaneous employees in `employee_states` with `deque(maxlen=30)` and 15f debouncing.
+        """
+        from src.calibration.online_engine import HysteresisStateMachine, ScaleInvariantMotionEngine
+        from src.config import TARGET_LANDMARKS
+        from src.tracking.landmarks import LandmarkPoint, SmoothedObservation
+
+        # 1. Verify HysteresisStateMachine strictly requires >=15 continuous frames before flipping
+        fsm = HysteresisStateMachine(initial_state="Sitting", min_dwell_frames=15)
+        fsm.step("Sitting")
+        # 14-frame transient pulse MUST NOT flip Sitting -> Standing
+        for _ in range(14):
+            self.assertEqual(fsm.step("Standing"), "Sitting")
+        self.assertEqual(fsm.step("Sitting"), "Sitting")
+        self.assertGreaterEqual(fsm.flickers_suppressed, 1)
+        # 15 consecutive frames MUST flip Sitting -> Standing on frame 15
+        for k in range(14):
+            self.assertEqual(fsm.step("Standing"), "Sitting")
+        self.assertEqual(fsm.step("Standing"), "Standing")
+
+        # 2. Verify Near (1.0x) vs Far (0.333x) camera scale invariance + simultaneous Emp #1 & Emp #2 isolation
+        def run_online_at_scale(scale: float):
+            w, h = int(round(1920 * scale)), int(round(1080 * scale))
+            engine = ScaleInvariantMotionEngine(window_size=30, min_dwell_frames=10, posture_threshold_norm=0.35)
+            out_e1, out_e2 = [], []
+            for idx in range(45):
+                t_sec = idx / 30.0
+                # Emp #1: Seated active typing (oscillating wrists)
+                osc = (2.4 if idx % 2 == 0 else -2.4) * scale
+                lms1 = {j: LandmarkPoint(j, 500 * scale, 750 * scale, 0.92) for j in TARGET_LANDMARKS}
+                lms1["left_shoulder"] = LandmarkPoint("left_shoulder", 440 * scale, 820 * scale, 0.95)
+                lms1["right_shoulder"] = LandmarkPoint("right_shoulder", 560 * scale, 820 * scale, 0.95)
+                lms1["left_hip"] = LandmarkPoint("left_hip", 455 * scale, 1020 * scale, 0.90)
+                lms1["right_hip"] = LandmarkPoint("right_hip", 545 * scale, 1020 * scale, 0.90)
+                lms1["left_wrist"] = LandmarkPoint("left_wrist", 445 * scale + osc, 900 * scale, 0.95)
+                lms1["right_wrist"] = LandmarkPoint("right_wrist", 555 * scale - osc, 900 * scale, 0.95)
+                obs1 = SmoothedObservation(
+                    track_id=1,
+                    tracking_status="tracked",
+                    bbox=(390 * scale, 700 * scale, 610 * scale, 1060 * scale),
+                    bbox_conf=0.93,
+                    landmarks=lms1,
+                )
+
+                # Emp #2 (simultaneous in same frame!): Standing completely idle & casually looking aside
+                lms2 = {j: LandmarkPoint(j, 1200 * scale, 480 * scale, 0.92) for j in TARGET_LANDMARKS}
+                lms2["nose"] = LandmarkPoint("nose", 1228 * scale, 482 * scale, 0.92)
+                lms2["left_eye"] = LandmarkPoint("left_eye", 1185 * scale, 470 * scale, 0.90)
+                lms2["right_eye"] = LandmarkPoint("right_eye", 1215 * scale, 470 * scale, 0.90)
+                lms2["left_shoulder"] = LandmarkPoint("left_shoulder", 1140 * scale, 560 * scale, 0.95)
+                lms2["right_shoulder"] = LandmarkPoint("right_shoulder", 1260 * scale, 560 * scale, 0.95)
+                lms2["left_hip"] = LandmarkPoint("left_hip", 1155 * scale, 800 * scale, 0.90)
+                lms2["right_hip"] = LandmarkPoint("right_hip", 1245 * scale, 800 * scale, 0.90)
+                lms2["left_wrist"] = LandmarkPoint("left_wrist", 1135 * scale, 770 * scale, 0.95)
+                lms2["right_wrist"] = LandmarkPoint("right_wrist", 1265 * scale, 770 * scale, 0.95)
+                obs2 = SmoothedObservation(
+                    track_id=2,
+                    tracking_status="tracked",
+                    bbox=(1090 * scale, 430 * scale, 1310 * scale, 1020 * scale),
+                    bbox_conf=0.93,
+                    landmarks=lms2,
+                )
+
+                out_e1.append(engine.update_observation(obs1, t_sec, 30.0, w, h))
+                out_e2.append(engine.update_observation(obs2, t_sec, 30.0, w, h))
+
+            self.assertEqual(set(engine.employee_states.keys()), {1, 2})
+            self.assertEqual(engine.employee_states[1].history.maxlen, 30)
+            self.assertEqual(len(engine.employee_states[1].history), 30)
+            return out_e1[-1], out_e2[-1]
+
+        near_e1, near_e2 = run_online_at_scale(1.0)
+        far_e1, far_e2 = run_online_at_scale(1.0 / 3.0)
+
+        # Identical normalized wrist speed (SW/s) and identical classifications across 3x scale change!
+        self.assertAlmostEqual(
+            near_e1["rolling_30f_wrist_vel_sw_s"],
+            far_e1["rolling_30f_wrist_vel_sw_s"],
+            places=3,
+        )
+        self.assertEqual(near_e1["motion_state"], "Sitting | Working")
+        self.assertEqual(far_e1["motion_state"], "Sitting | Working")
+        self.assertEqual(near_e2["motion_state"], "Standing | Idle")
+        self.assertEqual(far_e2["motion_state"], "Standing | Idle")
 
 
 if __name__ == "__main__":

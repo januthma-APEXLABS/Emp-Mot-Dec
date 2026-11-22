@@ -1,27 +1,30 @@
-"""Stage 1 Proof-of-Concept: MediaPipe heuristic baseline."""
+"""Legacy Stage-1 Baseline (Refactored to Scale-Invariant Shoulder-Width Math with Track_ID).
+
+Note: Production multi-person tracking & classification lives in `src/tracking/` and
+`src/calibration/` using YOLOv8-Pose `model.track(persist=True)` + `ScaleInvariantMotionEngine`.
+"""
 
 from collections import deque
 import csv
 import math
 from pathlib import Path
 import sys
+from typing import Dict
 
 import cv2
 import mediapipe as mp
 
-# Ensure project root is importable when executed directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.calibration.online_engine import HysteresisStateMachine
 from src.config import (
     DEFAULT_INPUT_VIDEO,
     TELEMETRY_OUTPUT_DIR,
     VIDEOS_OUTPUT_DIR,
     ensure_directories,
 )
-
-
 from src.tracking.visualizer import create_video_writer
 
 
@@ -42,90 +45,78 @@ def main() -> None:
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
 
     out = create_video_writer(output_video_path, fps, width, height)
 
-    wrist_history = deque(maxlen=fps)
+    # Dictionary-based state management with 30-frame rolling deque & 15-frame debouncers
+    employee_states: Dict[int, Dict[str, object]] = {
+        1: {
+            "wrist_vel_sw_window": deque(maxlen=30),
+            "prev_wrists": None,
+            "posture_fsm": HysteresisStateMachine(initial_state="Sitting", min_dwell_frames=15),
+            "activity_fsm": HysteresisStateMachine(initial_state="Idle", min_dwell_frames=15),
+        }
+    }
 
     with open(csv_report_path, mode="w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["Frame", "Timestamp_sec", "Presence", "Posture", "Activity"])
+        writer.writerow(["Frame", "Timestamp_sec", "Track_ID", "Presence", "Posture", "Activity"])
 
         frame_count = 0
-
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
             frame_count += 1
-            timestamp = round(frame_count / fps, 2)
+            timestamp = round((frame_count - 1) / fps, 4)
 
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image_rgb)
 
+            track_id_out = ""
             presence_state = "Away"
-            posture_state = "-"
-            activity_state = "-"
+            posture_state = "Away"
+            activity_state = "Away"
 
             if results.pose_landmarks:
+                tid = 1
+                track_id_out = str(tid)
                 presence_state = "Present"
+                st = employee_states[tid]
                 landmarks = results.pose_landmarks.landmark
 
-                left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-                right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+                ls = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+                rs = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+                lw = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+                rw = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
 
-                # Posture Logic
-                avg_shoulder_y = (left_shoulder.y + right_shoulder.y) / 2
-                posture_state = "Standing" if avg_shoulder_y < 0.4 else "Sitting"
+                bio_scale = max(math.hypot(ls.x - rs.x, ls.y - rs.y), 1e-3)
+                elev_norm = 1.0 - 0.5 * (ls.y + rs.y)
+                prop_posture = "Standing" if elev_norm >= 0.45 else "Sitting"
+                posture_state = st["posture_fsm"].step(prop_posture)  # type: ignore[attr-defined]
 
-                # Activity Logic
-                avg_wrist_x = (left_wrist.x + right_wrist.x) / 2
-                avg_wrist_y = (left_wrist.y + right_wrist.y) / 2
-                wrist_history.append((avg_wrist_x, avg_wrist_y))
+                curr_wrists = ((lw.x, lw.y), (rw.x, rw.y))
+                if st["prev_wrists"] is not None:
+                    plw, prw = st["prev_wrists"]  # type: ignore[misc]
+                    dl_sw = math.hypot(lw.x - plw[0], lw.y - plw[1]) / bio_scale
+                    dr_sw = math.hypot(rw.x - prw[0], rw.y - prw[1]) / bio_scale
+                    st["wrist_vel_sw_window"].append(max(dl_sw, dr_sw) * fps)  # type: ignore[attr-defined]
+                st["prev_wrists"] = curr_wrists
 
-                if len(wrist_history) == fps:
-                    start_x, start_y = wrist_history[0]
-                    end_x, end_y = wrist_history[-1]
-                    movement_distance = math.sqrt((end_x - start_x) ** 2 + (end_y - start_y) ** 2)
-                    activity_state = "Working" if movement_distance > 0.02 else "Idle"
+                vel_win = st["wrist_vel_sw_window"]  # type: ignore[assignment]
+                mean_sw_s = (sum(vel_win) / len(vel_win)) if len(vel_win) > 0 else 0.0
+                prop_act = "Working" if mean_sw_s >= 0.24 else "Idle"
+                activity_state = st["activity_fsm"].step(prop_act)  # type: ignore[attr-defined]
 
-                mp_drawing.draw_landmarks(
-                    frame,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2),
-                )
+                mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-            # Draw Dashboard Overlay
-            cv2.rectangle(frame, (10, 10), (350, 120), (0, 0, 0), -1)
-            cv2.putText(frame, f"Presence: {presence_state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, f"Posture:  {posture_state}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(
-                frame,
-                f"Activity: {activity_state}",
-                (20, 100),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0) if activity_state == "Working" else (0, 0, 255),
-                2,
-            )
-
-            writer.writerow([frame_count, timestamp, presence_state, posture_state, activity_state])
+            writer.writerow([frame_count, timestamp, track_id_out, presence_state, posture_state, activity_state])
             out.write(frame)
-
-            cv2.imshow("Employee Tracker", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
 
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
-    print(f"Processing complete! Saved video to '{output_video_path}' and report to '{csv_report_path}'.")
 
 
 if __name__ == "__main__":

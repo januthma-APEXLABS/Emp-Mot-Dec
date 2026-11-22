@@ -305,6 +305,7 @@ def extract_state_segments(
 
     for emp_id in emp_ids:
         emp_timeline = filter_telemetry(df, employee_id=emp_id)
+        vids = emp_timeline["video_name"].to_list()
         frames = emp_timeline["frame"].to_numpy()
         times = emp_timeline["timestamp_sec"].to_numpy()
         states = emp_timeline[state_col].to_list()
@@ -315,7 +316,7 @@ def extract_state_segments(
 
         s_idx = 0
         for i in range(1, n + 1):
-            is_gap = i < n and (frames[i] - frames[i - 1]) > 2
+            is_gap = i < n and (vids[i] != vids[i - 1] or abs(int(frames[i]) - int(frames[i - 1])) > 2)
             if i == n or states[i] != states[s_idx] or is_gap:
                 t_start = float(times[s_idx])
                 t_end = float(times[i - 1]) + dt

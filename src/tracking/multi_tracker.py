@@ -1,5 +1,8 @@
-"""Multi-person tracking with velocity-predicted Hungarian matching, barrier-occlusion memory,
-and torso HSV+Lab Appearance Re-Identification (Re-ID) gallery for persistent Employee IDs.
+"""Multi-person persistent tracking fusing YOLOv8 ByteTrack IDs (`model.track(persist=True)`),
+Kalman velocity-predicted Hungarian matching, and a scale-invariant Torso Appearance Re-ID Gallery.
+
+Zero hardcoded pixel distances: all spatial association gates are normalized against
+biological shoulder scale and frame diagonal geometry.
 """
 
 from dataclasses import dataclass, field
@@ -9,7 +12,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from src.config import TARGET_LANDMARKS
-from src.tracking.landmarks import DetectionRaw, LandmarkPoint, SmoothedObservation
+from src.tracking.landmarks import (
+    DetectionRaw,
+    LandmarkPoint,
+    SmoothedObservation,
+    estimate_biological_scale,
+)
 from src.tracking.smoother import (
     KalmanBBoxSmoother,
     KalmanPoint2DSmoother,
@@ -41,15 +49,22 @@ def extract_torso_appearance_embedding(
     frame_bgr: Optional[np.ndarray],
     det: DetectionRaw,
 ) -> Optional[np.ndarray]:
-    """Extract L2-normalized illumination-resilient HSV + CIE-Lab torso color histogram.
-
-    Uses only upper-torso clothing pixels (shoulders to hips) — zero facial biometrics stored.
-    """
+    """Extract L2-normalized illumination-resilient HSV + CIE-Lab torso color histogram."""
     if frame_bgr is None or frame_bgr.size == 0:
         return None
 
     h, w = frame_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
     x1, y1, x2, y2 = det.bbox
+    bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+    # Skip appearance only on thin border-clipped slivers (<6.5% width at frame edge) or tiny specks (<2% width)
+    touches_lr_edge = (x1 / float(w)) < 0.02 or (x2 / float(w)) > 0.98
+    if (bw / float(w)) < 0.020 or (touches_lr_edge and (bw / float(w)) < 0.065):
+        return None
+    bio_s = estimate_biological_scale(det.bbox, det.landmarks)
+    pad = 0.07 * bio_s
     lms = det.landmarks
 
     ls = lms.get("left_shoulder")
@@ -67,18 +82,17 @@ def extract_torso_appearance_embedding(
         and lh.conf > 0.25
         and rh.conf > 0.25
     ):
-        tx1 = int(max(0, min(ls.x, rs.x, lh.x, rh.x) - 8))
-        tx2 = int(min(w, max(ls.x, rs.x, lh.x, rh.x) + 8))
-        ty1 = int(max(0, min(ls.y, rs.y)))
-        ty2 = int(min(h, max(lh.y, rh.y)))
+        tx1 = int(max(0.0, min(ls.x, rs.x, lh.x, rh.x) - pad))
+        tx2 = int(min(float(w), max(ls.x, rs.x, lh.x, rh.x) + pad))
+        ty1 = int(max(0.0, min(ls.y, rs.y)))
+        ty2 = int(min(float(h), max(lh.y, rh.y)))
     else:
-        bw, bh = x2 - x1, y2 - y1
-        tx1 = int(max(0, x1 + 0.22 * bw))
-        tx2 = int(min(w, x2 - 0.22 * bw))
-        ty1 = int(max(0, y1 + 0.22 * bh))
-        ty2 = int(min(h, y1 + 0.68 * bh))
+        tx1 = int(max(0.0, x1 + 0.22 * bw))
+        tx2 = int(min(float(w), x2 - 0.22 * bw))
+        ty1 = int(max(0.0, y1 + 0.22 * bh))
+        ty2 = int(min(float(h), y1 + 0.68 * bh))
 
-    if tx2 - tx1 < 14 or ty2 - ty1 < 14:
+    if (tx2 - tx1) < max(int(0.012 * w), 2) or (ty2 - ty1) < max(int(0.015 * h), 2):
         return None
 
     patch = cv2.resize(frame_bgr[ty1:ty2, tx1:tx2], (32, 48), interpolation=cv2.INTER_AREA)
@@ -97,11 +111,13 @@ def extract_torso_appearance_embedding(
 
 @dataclass
 class EmployeeGalleryProfile:
-    """Persistent appearance & spatial memory for an identified employee across occlusions."""
+    """Persistent appearance & normalized spatial memory for an identified employee across occlusions."""
     track_id: int
     ema_embedding: Optional[np.ndarray] = None
     exemplars: List[np.ndarray] = field(default_factory=list)
     last_bbox: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    last_bio_scale: float = 1.0
+    last_raw_bt_id: Optional[int] = None
     last_seen_step: int = 0
     total_hits: int = 0
 
@@ -109,10 +125,15 @@ class EmployeeGalleryProfile:
         self,
         emb: Optional[np.ndarray],
         bbox: Tuple[float, float, float, float],
+        bio_scale: float,
         step: int,
         conf: float,
+        raw_bt_id: Optional[int] = None,
     ) -> None:
         self.last_bbox = bbox
+        self.last_bio_scale = max(bio_scale, 1e-3)
+        if raw_bt_id is not None:
+            self.last_raw_bt_id = raw_bt_id
         self.last_seen_step = step
         self.total_hits += 1
         if emb is None or conf < 0.50:
@@ -128,7 +149,6 @@ class EmployeeGalleryProfile:
         if nrm > 1e-6:
             self.ema_embedding = merged / nrm
 
-        # Store up to 5 diverse lighting/angle exemplars (e.g. doorway light vs desk shade)
         if len(self.exemplars) < 5:
             max_ex_sim = max(float(np.dot(emb, ex)) for ex in self.exemplars)
             if max_ex_sim < 0.92:
@@ -169,7 +189,7 @@ class SinglePersonTrack:
         self.last_bbox = initial_detection.bbox
         self.last_bbox_conf = initial_detection.bbox_conf
         self.last_landmarks = initial_detection.landmarks
-        self._just_reseeded: bool = False
+        self.last_raw_bt_id: Optional[int] = initial_detection.raw_track_id
 
         if smoother_type == "kalman":
             self.bbox_smoother = KalmanBBoxSmoother(dt=dt)
@@ -187,7 +207,6 @@ class SinglePersonTrack:
                 self.rolling_smoother.update_point(name, lm.x, lm.y, lm.conf)
 
     def get_predicted_matching_box(self) -> Tuple[float, float, float, float]:
-        """Return kinematic predicted box (when recently updated) or last known box."""
         if self.smoother_type == "kalman" and self.time_since_update <= 6:
             pred = self.bbox_smoother.predict_bbox()
             if pred is not None:
@@ -204,8 +223,9 @@ class SinglePersonTrack:
         self.last_bbox = detection.bbox
         self.last_bbox_conf = detection.bbox_conf
         self.last_landmarks = detection.landmarks
+        if detection.raw_track_id is not None:
+            self.last_raw_bt_id = detection.raw_track_id
 
-        # If re-acquired after a multi-frame occlusion gap, cleanly re-seed Kalman state at new pose
         if was_long_occluded:
             if self.smoother_type == "kalman":
                 self.bbox_smoother.reset()
@@ -302,7 +322,9 @@ class SinglePersonTrack:
 
 
 class PoseMultiTracker:
-    """Multi-person tracker with active kinematic Hungarian matching + Appearance Re-ID Gallery."""
+    """Dictionary-backed multi-person tracker combining ByteTrack ID persistence,
+    scale-invariant kinematic Hungarian matching, and Torso Appearance Re-ID.
+    """
 
     def __init__(
         self,
@@ -328,14 +350,23 @@ class PoseMultiTracker:
 
         self.step_idx: int = 0
         self.next_track_id: int = 1
-        self.active_tracks: List[SinglePersonTrack] = []
+        self._next_temp_id: int = -1
+        self.tracks_by_id: Dict[int, SinglePersonTrack] = {}
         self.gallery: Dict[int, EmployeeGalleryProfile] = {}
+        self.merged_id_map: Dict[int, int] = {}
 
-    def _is_isolated_detection(self, det_idx: int, detections: List[DetectionRaw]) -> bool:
-        """Avoid contaminating appearance gallery when two people strongly overlap."""
+    @property
+    def active_tracks(self) -> List[SinglePersonTrack]:
+        return list(self.tracks_by_id.values())
+
+    def _is_clean_isolated_detection(self, det_idx: int, detections: List[DetectionRaw]) -> bool:
+        """Ensure appearance gallery templates only update on unoccluded, non-border-clipped poses."""
         box_i = detections[det_idx].bbox
+        fw = max(float(self.frame_width), 1.0)
+        if (box_i[0] / fw) < 0.015 or (box_i[2] / fw) > 0.985:
+            return False
         for j, other in enumerate(detections):
-            if j != det_idx and compute_iou(box_i, other.bbox) > 0.15:
+            if j != det_idx and compute_iou(box_i, other.bbox) > 0.12:
                 return False
         return True
 
@@ -345,13 +376,13 @@ class PoseMultiTracker:
         emb: Optional[np.ndarray],
         excluded_ids: set,
     ) -> Optional[int]:
-        """Match a newly re-appearing detection against inactive employees in the Re-ID Gallery."""
         if not self.gallery:
             return None
 
         diag_len = max(float(np.hypot(self.frame_width, self.frame_height)), 1.0)
         d_cx = 0.5 * (det.bbox[0] + det.bbox[2])
         d_cy = 0.5 * (det.bbox[1] + det.bbox[3])
+        det_scale = estimate_biological_scale(det.bbox, det.landmarks)
 
         best_tid: Optional[int] = None
         best_score = -1.0
@@ -359,30 +390,46 @@ class PoseMultiTracker:
         for tid, prof in self.gallery.items():
             if tid in excluded_ids:
                 continue
-            # Require established gallery identity (at least 5 prior hits)
-            if prof.total_hits < 5:
+            if prof.total_hits < 3:
                 continue
 
             p_cx = 0.5 * (prof.last_bbox[0] + prof.last_bbox[2])
             p_cy = 0.5 * (prof.last_bbox[1] + prof.last_bbox[3])
-            dist_px = float(np.hypot(d_cx - p_cx, d_cy - p_cy))
+            dist_raw = float(np.hypot(d_cx - p_cx, d_cy - p_cy))
+            dist_diag_norm = dist_raw / diag_len
+            ref_bio = max(det_scale, prof.last_bio_scale, 1e-3)
+            dist_sw = dist_raw / ref_bio
             frames_absent = max(self.step_idx - prof.last_seen_step, 1)
 
             app_sim = prof.appearance_similarity(emb)
-            spatial_prox = float(np.exp(-dist_px / (0.45 * diag_len)))
+            bt_bonus = 0.08 if (det.raw_track_id is not None and det.raw_track_id == prof.last_raw_bt_id) else 0.0
+            spatial_prox = float(np.exp(-dist_diag_norm / 0.45))
             recency_bonus = 0.06 * float(np.exp(-frames_absent / 240.0))
 
+            # If this track is still actively alive (`time_since_update <= 25`), Stage 1 already evaluated it:
+            # only reconnect in Stage 2 if appearance strongly matches (`>= 0.76`) so a nearby newcomer never steals its ID!
+            live_trk = self.tracks_by_id.get(tid)
+            if live_trk is not None and live_trk.time_since_update <= 25:
+                if emb is not None and prof.ema_embedding is not None and app_sim >= 0.76 and dist_sw <= 2.5:
+                    score = 0.82 * app_sim + 0.18 * spatial_prox + recency_bonus + bt_bonus
+                    if score > best_score:
+                        best_score = score
+                        best_tid = tid
+                continue
+
             if emb is not None and prof.ema_embedding is not None:
-                # Strong torso color match (e.g. re-standing from behind desk or returning to doorway)
-                if app_sim >= 0.76 or (frames_absent <= 90 and dist_px <= 360.0 and app_sim >= 0.62):
-                    score = 0.82 * app_sim + 0.18 * spatial_prox + recency_bonus
+                if (
+                    app_sim >= 0.72
+                    or (frames_absent <= 120 and dist_sw <= 2.6 and app_sim >= 0.62)
+                    or (frames_absent <= 750 and dist_sw <= 1.65 and app_sim >= 0.54)
+                ):
+                    score = 0.78 * app_sim + 0.20 * spatial_prox + recency_bonus + bt_bonus
                     if score > best_score:
                         best_score = score
                         best_tid = tid
             else:
-                # Spatial-only fallback when no RGB frame was supplied
-                if frames_absent <= 45 and dist_px <= 260.0:
-                    score = spatial_prox + recency_bonus
+                if frames_absent <= 45 and dist_sw <= 2.2:
+                    score = spatial_prox + recency_bonus + bt_bonus
                     if score > best_score:
                         best_score = score
                         best_tid = tid
@@ -395,23 +442,26 @@ class PoseMultiTracker:
         frame: Optional[np.ndarray] = None,
     ) -> List[SmoothedObservation]:
         self.step_idx += 1
-        num_tracks = len(self.active_tracks)
+        track_list = list(self.tracks_by_id.values())
+        num_tracks = len(track_list)
         num_dets = len(detections)
 
         det_embeddings: List[Optional[np.ndarray]] = [
             extract_torso_appearance_embedding(frame, det) for det in detections
         ]
+        det_scales: List[float] = [
+            estimate_biological_scale(det.bbox, det.landmarks) for det in detections
+        ]
 
         matched_track_indices = set()
         matched_det_indices = set()
+        diag_len = max(float(np.hypot(self.frame_width, self.frame_height)), 1.0)
 
-        # --- Stage 1: Match detections against currently active tracks ---
         if num_tracks > 0 and num_dets > 0:
             cost_matrix = np.full((num_tracks, num_dets), 10.0, dtype=np.float32)
-            diag_len = max(float(np.hypot(self.frame_width, self.frame_height)), 1.0)
-            pred_boxes = [t.get_predicted_matching_box() for t in self.active_tracks]
+            pred_boxes = [t.get_predicted_matching_box() for t in track_list]
 
-            for t_idx, track in enumerate(self.active_tracks):
+            for t_idx, track in enumerate(track_list):
                 t_box = pred_boxes[t_idx]
                 t_cx = 0.5 * (t_box[0] + t_box[2])
                 t_cy = 0.5 * (t_box[1] + t_box[3])
@@ -424,113 +474,283 @@ class PoseMultiTracker:
 
                     iou = compute_iou(t_box, d_box)
                     dist_norm = float(np.hypot(t_cx - d_cx, t_cy - d_cy)) / diag_len
-                    geom_cost = (1.0 - iou) * 0.60 + dist_norm * 0.40
+                    bt_match = (
+                        det.raw_track_id is not None
+                        and track.last_raw_bt_id is not None
+                        and det.raw_track_id == track.last_raw_bt_id
+                    )
+                    target_match = det.target_track_id is not None and det.target_track_id == track.track_id
+                    if det.source == "lk_hold" and not target_match:
+                        continue
+                    geom_cost = (
+                        (1.0 - iou) * 0.60
+                        + dist_norm * 0.40
+                        - (0.18 if bt_match else 0.0)
+                        - (0.35 if target_match else 0.0)
+                    )
 
                     if prof is not None and det_embeddings[d_idx] is not None and prof.ema_embedding is not None:
                         app_sim = prof.appearance_similarity(det_embeddings[d_idx])
-                        cost_matrix[t_idx, d_idx] = 0.65 * geom_cost + 0.35 * (1.0 - app_sim)
+                        cost_matrix[t_idx, d_idx] = max(0.0, 0.65 * geom_cost + 0.35 * (1.0 - app_sim))
                     else:
-                        cost_matrix[t_idx, d_idx] = geom_cost
+                        cost_matrix[t_idx, d_idx] = max(0.0, geom_cost)
 
             row_ind, col_ind = linear_sum_assignment(cost_matrix)
             for r, c in zip(row_ind, col_ind):
-                track = self.active_tracks[r]
+                track = track_list[r]
                 det = detections[c]
+                if det.source == "lk_hold" and det.target_track_id != track.track_id:
+                    continue
                 t_box = pred_boxes[r]
                 iou = compute_iou(t_box, det.bbox)
                 t_cx = 0.5 * (t_box[0] + t_box[2])
                 t_cy = 0.5 * (t_box[1] + t_box[3])
                 d_cx = 0.5 * (det.bbox[0] + det.bbox[2])
                 d_cy = 0.5 * (det.bbox[1] + det.bbox[3])
-                center_px = float(np.hypot(t_cx - d_cx, t_cy - d_cy))
+                center_dist = float(np.hypot(t_cx - d_cx, t_cy - d_cy))
+                center_diag_norm = center_dist / diag_len
+                center_sw = center_dist / max(det_scales[c], 1e-3)
 
                 prof = self.gallery.get(track.track_id)
                 app_sim = prof.appearance_similarity(det_embeddings[c]) if prof else 0.0
+                bt_same = (
+                    det.raw_track_id is not None
+                    and track.last_raw_bt_id is not None
+                    and det.raw_track_id == track.last_raw_bt_id
+                )
+                target_same = det.target_track_id is not None and det.target_track_id == track.track_id
 
-                # Accept kinematic proximity or strong appearance continuity across brief gap
-                max_shift = 280.0 + min(track.time_since_update * 8.0, 140.0)
-                if iou >= self.iou_threshold or center_px < max_shift or (app_sim >= 0.78 and center_px < 520.0):
+                has_app_check = (
+                    prof is not None
+                    and prof.ema_embedding is not None
+                    and prof.total_hits >= 5
+                    and det_embeddings[c] is not None
+                    and det.source != "lk_hold"
+                )
+                # Prevent cross-occlusion ID hijack when a differently dressed person enters/crosses a track
+                app_veto = False
+                if has_app_check:
+                    if app_sim < 0.58 and not (iou >= 0.75 and track.time_since_update == 0):
+                        app_veto = True
+                    elif (track.time_since_update >= 1 or iou < 0.35) and app_sim < 0.65:
+                        app_veto = True
+
+                # Physically bounded per-frame shift gate in biological shoulder-widths (prevents teleport jumps!)
+                max_shift_sw = 0.65 + min(track.time_since_update * 0.18, 1.85)
+                if not app_veto and (
+                    iou >= self.iou_threshold
+                    or target_same
+                    or (bt_same and center_diag_norm < 0.15)
+                    or center_sw < max_shift_sw
+                    or (app_sim >= 0.78 and center_diag_norm < 0.22)
+                ):
                     track.update(det)
                     matched_track_indices.add(r)
                     matched_det_indices.add(c)
-                    if track.track_id not in self.gallery:
-                        self.gallery[track.track_id] = EmployeeGalleryProfile(track_id=track.track_id)
-                    emb_to_store = det_embeddings[c] if self._is_isolated_detection(c, detections) else None
-                    self.gallery[track.track_id].update_appearance(
-                        emb_to_store, det.bbox, self.step_idx, det.bbox_conf
-                    )
+                    if track.track_id > 0:
+                        if track.track_id not in self.gallery:
+                            self.gallery[track.track_id] = EmployeeGalleryProfile(track_id=track.track_id)
+                        emb_to_store = (
+                            det_embeddings[c]
+                            if (det.source != "lk_hold" and self._is_clean_isolated_detection(c, detections))
+                            else None
+                        )
+                        self.gallery[track.track_id].update_appearance(
+                            emb_to_store,
+                            det.bbox,
+                            det_scales[c],
+                            self.step_idx,
+                            det.bbox_conf,
+                            raw_bt_id=det.raw_track_id,
+                        )
 
-        # Mark unmatched active tracks as missed
-        for r in range(num_tracks):
+        for r, trk in enumerate(track_list):
             if r not in matched_track_indices:
-                self.active_tracks[r].mark_missed()
+                trk.mark_missed()
 
-        # IDs currently occupied in this frame (either matched right now or very recently active)
-        occupied_ids = {
-            self.active_tracks[r].track_id for r in matched_track_indices
-        } | {
-            t.track_id for idx, t in enumerate(self.active_tracks)
-            if idx not in matched_track_indices and t.time_since_update <= 15
-        }
+        # Only exclude tracks ALREADY matched on this current frame so occluded/coasting tracks can immediately Re-ID!
+        occupied_ids = {track_list[r].track_id for r in matched_track_indices if track_list[r].track_id > 0}
 
-        # --- Stage 2: Re-ID Gallery lookup or new Employee ID creation for unmatched detections ---
         for c in range(num_dets):
             if c in matched_det_indices:
                 continue
             det = detections[c]
+            if det.source == "lk_hold":
+                continue
             emb = det_embeddings[c]
 
             reid_tid = self._match_gallery_reid(det, emb, excluded_ids=occupied_ids)
             if reid_tid is not None:
-                # Re-attach to existing archived employee ID!
                 occupied_ids.add(reid_tid)
-                # Remove any stale ghost instance of reid_tid in active_tracks if present
-                self.active_tracks = [t for t in self.active_tracks if t.track_id != reid_tid]
-                revived_track = SinglePersonTrack(
-                    track_id=reid_tid,
-                    initial_detection=det,
-                    frame_width=self.frame_width,
-                    frame_height=self.frame_height,
-                    smoother_type=self.smoother_type,
-                    dt=1.0 / max(self.fps, 1.0),
+                if reid_tid in self.tracks_by_id:
+                    existing_trk = self.tracks_by_id[reid_tid]
+                    existing_trk.update(det)
+                else:
+                    revived_track = SinglePersonTrack(
+                        track_id=reid_tid,
+                        initial_detection=det,
+                        frame_width=self.frame_width,
+                        frame_height=self.frame_height,
+                        smoother_type=self.smoother_type,
+                        dt=1.0 / max(self.fps, 1.0),
+                    )
+                    revived_track.hits = self.gallery[reid_tid].total_hits + 1
+                    self.tracks_by_id[reid_tid] = revived_track
+                emb_to_store = emb if self._is_clean_isolated_detection(c, detections) else None
+                self.gallery[reid_tid].update_appearance(
+                    emb_to_store,
+                    det.bbox,
+                    det_scales[c],
+                    self.step_idx,
+                    det.bbox_conf,
+                    raw_bt_id=det.raw_track_id,
                 )
-                revived_track.hits = self.gallery[reid_tid].total_hits + 1
-                self.active_tracks.append(revived_track)
-                emb_to_store = emb if self._is_isolated_detection(c, detections) else None
-                self.gallery[reid_tid].update_appearance(emb_to_store, det.bbox, self.step_idx, det.bbox_conf)
             elif det.bbox_conf >= self.new_track_min_conf:
-                new_tid = self.next_track_id
-                self.next_track_id += 1
-                occupied_ids.add(new_tid)
+                fw_f = max(float(self.frame_width), 1.0)
+                fh_f = max(float(self.frame_height), 1.0)
+                dx1, dy1, dx2, dy2 = det.bbox
+                is_edge_sliver = (
+                    ((dx1 / fw_f) < 0.02 and (dx2 / fw_f) < 0.15)
+                    or ((dx2 / fw_f) > 0.98 and (dx1 / fw_f) > 0.85)
+                    or ((dy1 / fh_f) > 0.65 and (dx2 / fw_f) > 0.85)
+                )
+                has_established_gallery = any(
+                    p.total_hits >= 10 and p.ema_embedding is not None for p in self.gallery.values()
+                )
+                # Wait until torso enters frame enough to extract appearance before spawning a new ID
+                if is_edge_sliver or (frame is not None and emb is None and has_established_gallery):
+                    continue
+                # Allocate temporary negative ID on frame > 1 when `frame` is present; promote to permanent ID on 2nd hit!
+                use_probation = frame is not None and self.step_idx > 1
+                if use_probation:
+                    alloc_tid = self._next_temp_id
+                    self._next_temp_id -= 1
+                else:
+                    alloc_tid = self.next_track_id
+                    self.next_track_id += 1
+                    occupied_ids.add(alloc_tid)
                 new_track = SinglePersonTrack(
-                    track_id=new_tid,
+                    track_id=alloc_tid,
                     initial_detection=det,
                     frame_width=self.frame_width,
                     frame_height=self.frame_height,
                     smoother_type=self.smoother_type,
                     dt=1.0 / max(self.fps, 1.0),
                 )
-                self.active_tracks.append(new_track)
-                self.gallery[new_tid] = EmployeeGalleryProfile(track_id=new_tid)
-                emb_to_store = emb if self._is_isolated_detection(c, detections) else None
-                self.gallery[new_tid].update_appearance(emb_to_store, det.bbox, self.step_idx, det.bbox_conf)
+                self.tracks_by_id[alloc_tid] = new_track
+                if alloc_tid > 0:
+                    self.gallery[alloc_tid] = EmployeeGalleryProfile(track_id=alloc_tid)
+                    emb_to_store = emb if self._is_clean_isolated_detection(c, detections) else None
+                    self.gallery[alloc_tid].update_appearance(
+                        emb_to_store,
+                        det.bbox,
+                        det_scales[c],
+                        self.step_idx,
+                        det.bbox_conf,
+                        raw_bt_id=det.raw_track_id,
+                    )
 
-        # --- Stage 3: Prune expired active tracks & emit visible observations ---
-        surviving_tracks: List[SinglePersonTrack] = []
+        # Promote probationary tracks once confirmed (`hits >= req_hits`), matching gallery first before minting a new ID!
+        req_hits = max(self.min_hits, 4)
+        for t_key in list(self.tracks_by_id.keys()):
+            if t_key >= 0:
+                continue
+            p_trk = self.tracks_by_id[t_key]
+            if p_trk.hits >= req_hits and p_trk.hit_streak >= min(req_hits - 1, 4) and p_trk.time_since_update == 0:
+                p_det = DetectionRaw(
+                    bbox=p_trk.last_bbox,
+                    bbox_conf=p_trk.last_bbox_conf,
+                    class_id=0,
+                    landmarks=p_trk.last_landmarks,
+                    raw_track_id=p_trk.last_raw_bt_id,
+                )
+                p_emb = extract_torso_appearance_embedding(frame, p_det)
+                p_scale = estimate_biological_scale(p_det.bbox, p_det.landmarks)
+                # Exclude ONLY tracks updated on this current step (`time_since_update == 0`)
+                active_matched_ids = {k for k, v in self.tracks_by_id.items() if k > 0 and v.time_since_update == 0}
+                reid_match = self._match_gallery_reid(p_det, p_emb, excluded_ids=active_matched_ids)
+                if reid_match is not None:
+                    perm_id = reid_match
+                    p_trk.hits += self.gallery[perm_id].total_hits
+                else:
+                    perm_id = self.next_track_id
+                    self.next_track_id += 1
+                    self.gallery[perm_id] = EmployeeGalleryProfile(track_id=perm_id)
+                p_trk.track_id = perm_id
+                self.tracks_by_id[perm_id] = p_trk
+                del self.tracks_by_id[t_key]
+                self.gallery[perm_id].update_appearance(
+                    p_emb,
+                    p_det.bbox,
+                    p_scale,
+                    self.step_idx,
+                    p_det.bbox_conf,
+                    raw_bt_id=p_det.raw_track_id,
+                )
+
+        # Deferred gallery merge: if a newer track reveals a torso matching an un-matched veteran ID, merge!
+        matched_ids_now = {k for k, v in self.tracks_by_id.items() if k > 0 and v.time_since_update == 0}
+        for y_tid in list(matched_ids_now):
+            y_trk = self.tracks_by_id.get(y_tid)
+            y_prof = self.gallery.get(y_tid)
+            if y_trk is None or y_prof is None or y_trk.hits > 90 or y_prof.ema_embedding is None:
+                continue
+            y_cx = 0.5 * (y_trk.last_bbox[0] + y_trk.last_bbox[2])
+            y_cy = 0.5 * (y_trk.last_bbox[1] + y_trk.last_bbox[3])
+            best_vet_tid: Optional[int] = None
+            best_vet_score = 0.0
+            for vet_tid, vet_prof in self.gallery.items():
+                if vet_tid == y_tid or vet_tid in matched_ids_now:
+                    continue
+                if vet_prof.total_hits < 15 or vet_prof.ema_embedding is None or vet_tid > y_tid:
+                    continue
+                sim = vet_prof.appearance_similarity(y_prof.ema_embedding)
+                v_cx = 0.5 * (vet_prof.last_bbox[0] + vet_prof.last_bbox[2])
+                v_cy = 0.5 * (vet_prof.last_bbox[1] + vet_prof.last_bbox[3])
+                d_sw = float(np.hypot(y_cx - v_cx, y_cy - v_cy)) / max(y_prof.last_bio_scale, vet_prof.last_bio_scale, 1e-3)
+                vet_still_alive = vet_tid in self.tracks_by_id
+                if (not vet_still_alive and sim >= 0.80 and d_sw <= 2.2) or (sim >= 0.65 and d_sw <= 1.15):
+                    cand_sc = sim + (0.08 if d_sw <= 1.15 else 0.0)
+                    if cand_sc > best_vet_score:
+                        best_vet_score = cand_sc
+                        best_vet_tid = vet_tid
+            if best_vet_tid is not None:
+                self.merged_id_map[y_tid] = best_vet_tid
+                y_trk.track_id = best_vet_tid
+                y_trk.hits += self.gallery[best_vet_tid].total_hits
+                self.gallery[best_vet_tid].update_appearance(
+                    y_prof.ema_embedding,
+                    y_trk.last_bbox,
+                    y_prof.last_bio_scale,
+                    self.step_idx,
+                    y_trk.last_bbox_conf,
+                    raw_bt_id=y_trk.last_raw_bt_id,
+                )
+                self.tracks_by_id[best_vet_tid] = y_trk
+                del self.tracks_by_id[y_tid]
+                del self.gallery[y_tid]
+                matched_ids_now.discard(y_tid)
+                matched_ids_now.add(best_vet_tid)
+                if self.next_track_id == y_tid + 1:
+                    self.next_track_id = y_tid
+
+        surviving: Dict[int, SinglePersonTrack] = {}
         observations: List[SmoothedObservation] = []
 
-        for track in self.active_tracks:
-            # Keep tentative tracks alive for up to 5 frames so a 1-frame doorway miss doesn't drop ID #1!
-            max_allowed_miss = 5 if track.hits < self.min_hits else self.max_age_frames
+        for tid, track in self.tracks_by_id.items():
+            max_allowed_miss = (2 if tid < 0 else 5) if track.hits < self.min_hits else self.max_age_frames
             if track.time_since_update <= max_allowed_miss:
-                surviving_tracks.append(track)
-
+                surviving[tid] = track
+                if tid < 0:
+                    if track.time_since_update == 0:
+                        _ = track.get_smoothed_observation(is_coasted=False)
+                    continue
                 is_coasting = track.time_since_update > 0
                 if not is_coasting:
                     observations.append(track.get_smoothed_observation(is_coasted=False))
                 elif track.hits >= self.min_hits and track.time_since_update <= self.max_coast_render_frames:
                     observations.append(track.get_smoothed_observation(is_coasted=True))
 
-        self.active_tracks = surviving_tracks
+        self.tracks_by_id = surviving
         observations.sort(key=lambda o: o.track_id)
         return observations

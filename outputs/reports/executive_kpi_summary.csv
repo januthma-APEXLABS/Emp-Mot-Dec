@@ -1,4 +1,4 @@
 Scope,Active_Seconds,Duration_Formatted,Working_Pct,Idle_Pct,Sitting_Pct,Standing_Pct,Walking_Pct,Away_Pct,Mean_Wrist_Speed_px_s,Peak_Wrist_Speed_px_s,Posture_Transitions
-All Observations (Aggregate),214.47,3m 34.5s,71.7,10.8,63.0,19.6,13.9,3.6,187.47,927.27,61
-Emp #1,188.17,3m 08.2s,73.5,11.8,68.8,16.5,10.8,3.9,158.95,731.88,43
-Emp #2,18.67,18.7s,5.1,0.0,0.2,4.9,4.4,90.5,474.93,1436.94,18
+All Observations (Aggregate),178.47,2m 58.5s,68.8,19.2,67.5,20.5,8.9,3.1,202.77,1273.14,24
+Emp #1,122.1,2m 02.1s,72.4,10.9,77.5,5.7,9.3,7.5,180.31,732.31,15
+Emp #2,50.77,50.8s,20.6,15.1,13.7,22.0,2.8,61.5,256.79,1632.79,9

@@ -14,7 +14,8 @@ from src.config import (
 )
 from src.tracking.landmarks import DetectionRaw, LandmarkPoint
 from src.tracking.multi_tracker import PoseMultiTracker, compute_iou
-from src.tracking.pipeline import CSV_HEADER, BatchTrackingPipeline, compute_acceleration_jitter
+from src.tracking.pixel_motion import PixelMotionPoseAssister
+from src.tracking.pipeline import CSV_HEADER, CSV_ONLINE_BEHAVIOR_COLS, BatchTrackingPipeline, compute_acceleration_jitter
 from src.tracking.smoother import (
     KalmanBBoxSmoother,
     KalmanPoint2DSmoother,
@@ -183,9 +184,13 @@ class TestMilestone1Tracking(unittest.TestCase):
         self.assertEqual(by_x[1].track_id, 2, "Distinct simultaneous visitor must receive Emp #2!")
 
     def test_13_landmark_schema_and_adaptive_zero_lag_kalman(self):
-        """Verify 13-keypoint CSV header (53 cols) and innovation-adaptive Kalman tracking during fast walking."""
+        """Verify Track_ID + 13-keypoint + online behavior CSV schema and zero-lag Kalman tracking."""
         self.assertEqual(len(TARGET_LANDMARKS), 13)
-        self.assertEqual(len(CSV_HEADER), 14 + 13 * 3)
+        self.assertIn("Track_ID", CSV_HEADER)
+        self.assertIn("rolling_30f_wrist_vel_sw_s", CSV_HEADER)
+        self.assertIn("wrist_pixel_motion_ratio", CSV_HEADER)
+        self.assertIn("lk_wrist_flow_sw_s", CSV_HEADER)
+        self.assertEqual(len(CSV_HEADER), 15 + 13 * 3 + len(CSV_ONLINE_BEHAVIOR_COLS))
 
         # Fast movement step: 20 px/frame (600 px/s) across doorway
         smoother = KalmanPoint2DSmoother(dt=1.0 / 30.0)
@@ -228,6 +233,69 @@ class TestMilestone1Tracking(unittest.TestCase):
             self.assertTrue(Path(stats["output_csv_path"]).exists())
             self.assertTrue(Path(stats["output_video_path"]).exists())
             self.assertGreater(stats["csv_rows_written"], 0)
+
+    def test_pixel_motion_rejects_non_human_noise_and_retains_stationary_employee(self):
+        """Verify inter-frame pixel changes reject non-employee moving pixels (flashing monitor/shadow)
+        while keeping a motionless seated employee persistently tracked via torso ZNCC + optical flow.
+        """
+        w, h = 640, 480
+        assister = PixelMotionPoseAssister(frame_width=w, frame_height=h, fps=30.0)
+        tracker = PoseMultiTracker(frame_width=w, frame_height=h, fps=30.0)
+
+        # 1. Non-human moving pixel test: bright flashing/translating rectangle on empty background -> 0 false tracks
+        for f_idx in range(8):
+            frame_noise = np.full((h, w, 3), 210, dtype=np.uint8)
+            rx = 80 + 25 * f_idx
+            frame_noise[120:260, rx : rx + 90] = (20, 240, 20)
+            dets = assister.augment_detections(frame_noise, yolo_detections=[], active_tracks=tracker.active_tracks)
+            obs = tracker.update(dets, frame=frame_noise)
+            assister.attach_pixel_motion_metrics(obs, dets)
+            self.assertEqual(len(obs), 0, "Non-human moving rectangle must NEVER create an employee track!")
+
+        assister.close()
+
+        # 2. Motionless employee retention + wrist pixel-motion gate test
+        assister2 = PixelMotionPoseAssister(frame_width=w, frame_height=h, fps=30.0)
+        tracker2 = PoseMultiTracker(frame_width=w, frame_height=h, fps=30.0)
+
+        static_frame = np.full((h, w, 3), 205, dtype=np.uint8)
+        # Textured blue shirt torso at (260..380, 180..360) so ZNCC & appearance have realistic gradient structure
+        yy, xx = np.mgrid[180:360, 260:380]
+        static_frame[180:360, 260:380, 0] = np.clip(180 + ((xx + yy) % 25), 0, 255).astype(np.uint8)
+        static_frame[180:360, 260:380, 1] = np.clip(95 + ((xx * 2) % 20), 0, 255).astype(np.uint8)
+        static_frame[180:360, 260:380, 2] = 45
+
+        lms = {jn: LandmarkPoint(jn, 320.0, 155.0, 0.92, 320.0 / w, 155.0 / h) for jn in TARGET_LANDMARKS}
+        lms["left_shoulder"] = LandmarkPoint("left_shoulder", 280.0, 200.0, 0.95, 280.0 / w, 200.0 / h)
+        lms["right_shoulder"] = LandmarkPoint("right_shoulder", 360.0, 200.0, 0.95, 360.0 / w, 200.0 / h)
+        lms["left_elbow"] = LandmarkPoint("left_elbow", 270.0, 260.0, 0.90, 270.0 / w, 260.0 / h)
+        lms["right_elbow"] = LandmarkPoint("right_elbow", 370.0, 260.0, 0.90, 370.0 / w, 260.0 / h)
+        lms["left_wrist"] = LandmarkPoint("left_wrist", 290.0, 300.0, 0.92, 290.0 / w, 300.0 / h)
+        lms["right_wrist"] = LandmarkPoint("right_wrist", 350.0, 300.0, 0.92, 350.0 / w, 300.0 / h)
+        lms["left_hip"] = LandmarkPoint("left_hip", 290.0, 340.0, 0.88, 290.0 / w, 340.0 / h)
+        lms["right_hip"] = LandmarkPoint("right_hip", 350.0, 340.0, 0.88, 350.0 / w, 340.0 / h)
+        seed_det = DetectionRaw(bbox=(250.0, 130.0, 390.0, 380.0), bbox_conf=0.92, class_id=0, landmarks=lms)
+
+        # Prime confirmed employee track for 4 frames
+        for _ in range(4):
+            dets = assister2.augment_detections(static_frame, yolo_detections=[seed_det], active_tracks=tracker2.active_tracks)
+            obs = tracker2.update(dets, frame=static_frame)
+            assister2.attach_pixel_motion_metrics(obs, dets)
+
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0].track_id, 1)
+
+        # Now drop YOLO detections while employee sits 100% motionless -> must stay tracked (NOT Away!) with 0 wrist pixel motion
+        for _ in range(5):
+            dets_hold = assister2.augment_detections(static_frame, yolo_detections=[], active_tracks=tracker2.active_tracks)
+            obs_hold = tracker2.update(dets_hold, frame=static_frame)
+            assister2.attach_pixel_motion_metrics(obs_hold, dets_hold)
+            self.assertEqual(len(obs_hold), 1, "Motionless seated employee must remain tracked!")
+            self.assertEqual(obs_hold[0].track_id, 1)
+            self.assertEqual(obs_hold[0].tracking_status, "tracked")
+            self.assertAlmostEqual(obs_hold[0].wrist_pixel_motion_ratio or 0.0, 0.0, places=3)
+
+        assister2.close()
 
 
 if __name__ == "__main__":

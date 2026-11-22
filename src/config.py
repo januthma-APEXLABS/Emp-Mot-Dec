@@ -10,6 +10,71 @@ if "YOLO_CONFIG_DIR" not in os.environ:
 if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = "/tmp/mpl"
 
+
+def _ensure_lap_shim() -> None:
+    """Provide a SciPy-backed `lap.lapjv` compatibility module when `lap` C-extension is absent,
+    enabling Ultralytics `model.track(..., persist=True)` ByteTrack/BoT-SORT offline.
+    """
+    import sys
+    import types
+
+    if "lap" in sys.modules:
+        return
+    try:
+        import lap  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    def lapjv(cost_matrix: np.ndarray, extend_cost: bool = False, cost_limit: float = np.inf, return_cost: bool = True):
+        cmat = np.asarray(cost_matrix, dtype=np.float64)
+        n_rows, n_cols = cmat.shape
+        if n_rows == 0 or n_cols == 0:
+            x = np.full(n_rows, -1, dtype=np.int32)
+            y = np.full(n_cols, -1, dtype=np.int32)
+            return (0.0, x, y) if return_cost else (x, y)
+
+        if np.isfinite(cost_limit):
+            big = float(max(np.max(cmat[np.isfinite(cmat)], initial=1.0), abs(cost_limit)) * 1e6 + 1e6)
+            work = np.where(np.isfinite(cmat), cmat, big)
+            slack = np.full((n_rows, n_rows), big, dtype=np.float64)
+            np.fill_diagonal(slack, float(cost_limit))
+            aug = np.hstack([work, slack])
+            r_ind, c_ind = linear_sum_assignment(aug)
+            x = np.full(n_rows, -1, dtype=np.int32)
+            y = np.full(n_cols, -1, dtype=np.int32)
+            total_cost = 0.0
+            for r, c in zip(r_ind, c_ind):
+                if c < n_cols and cmat[r, c] <= cost_limit:
+                    x[r] = int(c)
+                    y[c] = int(r)
+                    total_cost += float(cmat[r, c])
+            return (total_cost, x, y) if return_cost else (x, y)
+
+        if not extend_cost and n_rows != n_cols:
+            raise ValueError("Non-square matrix requires extend_cost=True")
+
+        r_ind, c_ind = linear_sum_assignment(cmat)
+        x = np.full(n_rows, -1, dtype=np.int32)
+        y = np.full(n_cols, -1, dtype=np.int32)
+        total_cost = 0.0
+        for r, c in zip(r_ind, c_ind):
+            x[r] = int(c)
+            y[c] = int(r)
+            total_cost += float(cmat[r, c])
+        return (total_cost, x, y) if return_cost else (x, y)
+
+    shim = types.ModuleType("lap")
+    shim.__version__ = "0.5.12-scipy-shim"
+    shim.lapjv = lapjv  # type: ignore[attr-defined]
+    sys.modules["lap"] = shim
+
+
+_ensure_lap_shim()
+
 # Base project root: employee-motion-tracker/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

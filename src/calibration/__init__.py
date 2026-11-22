@@ -9,6 +9,11 @@ from src.calibration.calibrator import (
     otsu_threshold_1d,
 )
 from src.calibration.features import compute_temporal_features, load_and_extract_features
+from src.calibration.online_engine import (
+    EmployeeMotionState,
+    HysteresisStateMachine,
+    ScaleInvariantMotionEngine,
+)
 from src.calibration.rules_engine import (
     BehaviorRulesEngine,
     apply_hysteresis_and_dwell,

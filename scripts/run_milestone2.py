@@ -75,24 +75,24 @@ def main() -> None:
     ct = summary["calibrated_thresholds"]
     cm = summary["classification_metrics"]
 
-    print("Calibrated Mathematical Thresholds:")
-    print(f"  - Global Posture Threshold (H - Avg_Shoulder_Y): {ct['global_posture_threshold_px']} px ({ct['global_posture_threshold_norm']} H)")
+    print("Calibrated Scale-Invariant Thresholds:")
+    print(f"  - Global Normalized Posture Cutoff ((H - Avg_Sh_Y)/H): {ct['global_posture_threshold_norm']:.4f} H")
     if ct["use_perspective_zones"]:
-        print(f"  - Perspective Zone Split X:                      {ct['perspective_split_x_px']} px")
+        print(f"  - Perspective Zone Split (X / W):                      {ct['perspective_split_x_norm']:.4f} W")
         for z_name, z_cfg in ct["posture_zones"].items():
             if z_name == "global":
                 continue
             print(
-                f"    * {z_name.capitalize():10s} Zone: {z_cfg['threshold_px']} px "
-                f"(Seated median={z_cfg['seated_median_px']} px, Standing median={z_cfg['standing_median_px']} px)"
+                f"    * {z_name.capitalize():10s} Zone: {z_cfg['threshold_norm']:.4f} H "
+                f"(Seated med={z_cfg['seated_median_norm']:.4f}, Standing med={z_cfg['standing_median_norm']:.4f})"
             )
     print(
-        f"  - Rolling {ct['wrist_window_frames']}f Wrist Speed Threshold:             "
-        f"{ct['wrist_velocity_threshold_px_s']} px/s ({ct['wrist_velocity_threshold_px_frame']} px/frame)"
+        f"  - Rolling {ct['wrist_window_frames']}f Wrist Speed Cutoff (Shoulder-Widths/s): "
+        f"{ct['wrist_velocity_threshold_sw_s']:.4f} SW/s"
     )
     print(
-        f"    * Schmitt Hysteresis Band:                     "
-        f"[{ct['exit_to_idle_vel_px_s']}, {ct['enter_working_vel_px_s']}] px/s"
+        f"    * Schmitt Hysteresis Band:                           "
+        f"[{ct['exit_to_idle_vel_sw_s']:.4f}, {ct['enter_working_vel_sw_s']:.4f}] SW/s"
     )
 
     print("\nBehavior Classification Summary (6-Class Taxonomy):")

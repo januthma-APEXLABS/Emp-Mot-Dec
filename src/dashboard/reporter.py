@@ -83,10 +83,12 @@ def _draw_executive_hero_figure(df: pl.DataFrame, kpis: Dict[str, Any], title_te
         color=TEXT_MAIN,
         va="center",
     )
+    emp_ids_list = kpis.get("employee_ids", [])
+    emp_ids_str = f" ({', '.join(f'Emp #{eid}' for eid in emp_ids_list)})" if emp_ids_list else ""
     sub_meta = (
         f"Frames: {kpis['unique_frames']:,}  |  "
         f"Video Duration: {format_duration_mmss(kpis['video_duration_sec'])}  |  "
-        f"Employees Identified: {kpis['unique_employees']} (Emp #1, Emp #2)  |  "
+        f"Employees Identified: {kpis['unique_employees']}{emp_ids_str}  |  "
         f"Mean Wrist Speed: {kpis['mean_wrist_vel_px_s']:.1f} px/s"
     )
     ax_hdr.text(0.0, 0.08, sub_meta, fontsize=10.8, color=TEXT_SUB, va="center")

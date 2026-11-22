@@ -1,4 +1,8 @@
-"""Keypoint and bounding box extraction data structures with pose-aware NMS deduplication."""
+"""Scale-invariant keypoint and bounding box extraction with pose-aware NMS deduplication.
+
+Zero hardcoded pixel thresholds: all anatomical and spatial checks scale dynamically
+with biological inter-shoulder distance and normalized frame geometry.
+"""
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -9,7 +13,7 @@ from src.config import KEYPOINT_INDICES, TARGET_LANDMARKS
 
 @dataclass
 class LandmarkPoint:
-    """Single landmark point in pixel and normalized coordinates."""
+    """Single landmark point in pixel and normalized [0, 1] coordinates."""
     name: str
     x: float
     y: float
@@ -20,16 +24,19 @@ class LandmarkPoint:
 
 @dataclass
 class DetectionRaw:
-    """Raw bounding box and keypoints detected by YOLOv8-Pose in one person instance."""
+    """Raw bounding box, optional ByteTrack ID, and keypoints detected by YOLOv8-Pose or Pixel-Motion Pose."""
     bbox: Tuple[float, float, float, float]
     bbox_conf: float
     class_id: int
     landmarks: Dict[str, LandmarkPoint] = field(default_factory=dict)
+    raw_track_id: Optional[int] = None
+    source: str = "yolo"
+    target_track_id: Optional[int] = None
 
 
 @dataclass
 class SmoothedObservation:
-    """Smoothed bounding box, target landmarks, and optional live behavior tags for an active track."""
+    """Smoothed bounding box, target landmarks, pixel-motion telemetry, and live behavior tags."""
     track_id: int
     tracking_status: str  # "tracked" or "coasted"
     bbox: Tuple[float, float, float, float]
@@ -38,6 +45,45 @@ class SmoothedObservation:
     raw_bbox: Optional[Tuple[float, float, float, float]] = None
     raw_landmarks: Optional[Dict[str, LandmarkPoint]] = None
     behavior_label: Optional[str] = None
+    posture_state: Optional[str] = None
+    activity_state: Optional[str] = None
+    wrist_pixel_motion_ratio: Optional[float] = None
+    lk_wrist_flow_sw_s: Optional[float] = None
+
+
+def estimate_biological_scale(
+    bbox: Tuple[float, float, float, float],
+    landmarks: Dict[str, LandmarkPoint],
+) -> float:
+    """Estimate instantaneous biological reference scale (shoulder breadth) without fixed pixel floors."""
+    x1, y1, x2, y2 = bbox
+    bw = max(x2 - x1, 1e-3)
+    bh = max(y2 - y1, 1e-3)
+
+    ls = landmarks.get("left_shoulder")
+    rs = landmarks.get("right_shoulder")
+    sh_w = 0.0
+    if ls is not None and rs is not None and ls.conf >= 0.20 and rs.conf >= 0.20:
+        sh_w = float(np.hypot(ls.x - rs.x, ls.y - rs.y))
+
+    lh = landmarks.get("left_hip")
+    rh = landmarks.get("right_hip")
+    spine_l = 0.0
+    if (
+        ls is not None
+        and rs is not None
+        and lh is not None
+        and rh is not None
+        and (ls.conf >= 0.20 or rs.conf >= 0.20)
+        and (lh.conf >= 0.20 or rh.conf >= 0.20)
+    ):
+        sh_mx = 0.5 * (ls.x + rs.x)
+        sh_my = 0.5 * (ls.y + rs.y)
+        hp_mx = 0.5 * (lh.x + rh.x)
+        hp_my = 0.5 * (lh.y + rh.y)
+        spine_l = float(np.hypot(hp_mx - sh_mx, hp_my - sh_my))
+
+    return max(sh_w, 0.68 * spine_l, 0.22 * bh, 0.32 * bw, 1e-3)
 
 
 def _box_iou_and_containment(
@@ -63,16 +109,19 @@ def _box_iou_and_containment(
 def is_plausible_human_pose(
     bbox: Tuple[float, float, float, float],
     landmarks: Dict[str, LandmarkPoint],
+    frame_width: int = 1920,
     frame_height: int = 1080,
 ) -> bool:
-    """Reject degenerate non-human or bottom-border fragment detections using skeletal anatomy."""
+    """Reject degenerate non-human or border-fragment detections using scale-invariant ratios."""
     x1, y1, x2, y2 = bbox
     bw, bh = x2 - x1, y2 - y1
-    if bw < 35.0 or bh < 85.0:
+    fw = max(float(frame_width), 1.0)
+    fh = max(float(frame_height), 1.0)
+
+    if (bw / fw) < 0.022 or (bh / fh) < 0.11:
         return False
 
-    # Reject tiny bottom-edge fragments (e.g. top of head/bag barely peeking at bottom of frame)
-    if frame_height > 200 and y1 > 0.86 * frame_height:
+    if (y1 / fh) > 0.86:
         return False
 
     ls = landmarks.get("left_shoulder")
@@ -83,28 +132,44 @@ def is_plausible_human_pose(
     if ls.conf < 0.20 and rs.conf < 0.20:
         return False
 
-    if frame_height > 200:
-        sh_y = 0.5 * (ls.y + rs.y)
-        if sh_y > frame_height - 25.0:
+    sh_y = 0.5 * (ls.y + rs.y)
+    if (sh_y / fh) > 0.977:
+        return False
+
+    bio_scale = estimate_biological_scale(bbox, landmarks)
+    nose = landmarks.get("nose")
+    if nose and nose.conf > 0.30 and (ls.conf > 0.25 or rs.conf > 0.25):
+        if nose.y > sh_y + 0.28 * bio_scale:
             return False
 
-    nose = landmarks.get("nose")
     lh = landmarks.get("left_hip")
     rh = landmarks.get("right_hip")
-    if nose and lh and rh and nose.conf > 0.35 and lh.conf > 0.25 and rh.conf > 0.25:
+    if lh and rh and lh.conf > 0.28 and rh.conf > 0.28:
+        hip_x = 0.5 * (lh.x + rh.x)
         hip_y = 0.5 * (lh.y + rh.y)
-        if nose.y > hip_y + 15.0:
+        sh_x = 0.5 * (ls.x + rs.x)
+        # Reject inverted or sideways (>54-deg horizontal) non-human chair/furniture hallucinations
+        if (hip_y - sh_y) < 0.22 * bio_scale:
+            return False
+        if abs(hip_x - sh_x) > 1.38 * max(hip_y - sh_y, 1.0):
+            return False
+        if nose and nose.conf > 0.35 and nose.y > hip_y + 0.12 * bio_scale:
             return False
 
     return True
 
 
 def deduplicate_detections(detections: List[DetectionRaw]) -> List[DetectionRaw]:
-    """Suppress duplicate boxes/skeletons generated on the same person near frame borders."""
+    """Suppress duplicate skeletons on the same person using IoU, containment, and shoulder-scale proximity."""
     if len(detections) <= 1:
         return detections
 
-    ordered = sorted(detections, key=lambda d: d.bbox_conf, reverse=True)
+    # Prefer high-confidence, unclipped full-torso detections over small partial fragments
+    ordered = sorted(
+        detections,
+        key=lambda d: d.bbox_conf * (1.0 + 0.15 * min(((d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1])) ** 0.5 / 120.0, 1.5)),
+        reverse=True,
+    )
     kept: List[DetectionRaw] = []
 
     for cand in ordered:
@@ -114,10 +179,11 @@ def deduplicate_detections(detections: List[DetectionRaw]) -> List[DetectionRaw]
         c_has_sh = c_ls is not None and c_rs is not None and (c_ls.conf > 0.25 or c_rs.conf > 0.25)
         c_sh_x = 0.5 * (c_ls.x + c_rs.x) if c_has_sh else 0.5 * (cand.bbox[0] + cand.bbox[2])
         c_sh_y = 0.5 * (c_ls.y + c_rs.y) if c_has_sh else 0.5 * (cand.bbox[1] + cand.bbox[3])
+        c_scale = estimate_biological_scale(cand.bbox, cand.landmarks)
 
         for acc in kept:
             iou, contain = _box_iou_and_containment(cand.bbox, acc.bbox)
-            if iou >= 0.42 or contain >= 0.72:
+            if iou >= 0.38 or contain >= 0.54:
                 is_dup = True
                 break
 
@@ -127,7 +193,9 @@ def deduplicate_detections(detections: List[DetectionRaw]) -> List[DetectionRaw]
             if c_has_sh and a_has_sh:
                 a_sh_x = 0.5 * (a_ls.x + a_rs.x)
                 a_sh_y = 0.5 * (a_ls.y + a_rs.y)
-                if float(np.hypot(c_sh_x - a_sh_x, c_sh_y - a_sh_y)) < 85.0:
+                a_scale = estimate_biological_scale(acc.bbox, acc.landmarks)
+                ref_scale = max(c_scale, a_scale, 1e-3)
+                if (float(np.hypot(c_sh_x - a_sh_x, c_sh_y - a_sh_y)) / ref_scale) < 0.65:
                     is_dup = True
                     break
 
@@ -141,9 +209,9 @@ def extract_detections_from_results(
     results,
     frame_width: int,
     frame_height: int,
-    min_bbox_conf: float = 0.32,
+    min_bbox_conf: float = 0.22,
 ) -> List[DetectionRaw]:
-    """Extract deduplicated person bounding boxes and all 13 target landmarks from Ultralytics Results."""
+    """Extract deduplicated person boxes, ByteTrack IDs, and 13 landmarks from Ultralytics Results."""
     detections: List[DetectionRaw] = []
     if results is None or len(results) == 0:
         return detections
@@ -155,9 +223,13 @@ def extract_detections_from_results(
     boxes = res.boxes.xyxy.cpu().numpy()
     confs = res.boxes.conf.cpu().numpy()
     clss = res.boxes.cls.cpu().numpy()
+    raw_ids = res.boxes.id.int().cpu().numpy() if res.boxes.id is not None else None
 
     has_kpts = res.keypoints is not None and len(res.keypoints.data) > 0
     kpts_data = res.keypoints.data.cpu().numpy() if has_kpts else None
+
+    fw = max(float(frame_width), 1.0)
+    fh = max(float(frame_height), 1.0)
 
     for i in range(len(boxes)):
         bbox_conf = float(confs[i])
@@ -166,6 +238,7 @@ def extract_detections_from_results(
 
         x1, y1, x2, y2 = [float(v) for v in boxes[i]]
         cls_id = int(clss[i])
+        bt_id = int(raw_ids[i]) if (raw_ids is not None and i < len(raw_ids)) else None
 
         landmarks_dict: Dict[str, LandmarkPoint] = {}
         if kpts_data is not None and i < len(kpts_data):
@@ -176,8 +249,8 @@ def extract_detections_from_results(
                     kx = float(inst_kpts[idx, 0])
                     ky = float(inst_kpts[idx, 1])
                     kc = float(inst_kpts[idx, 2])
-                    kx_norm = min(max(kx / frame_width, 0.0), 1.0) if frame_width > 0 else 0.0
-                    ky_norm = min(max(ky / frame_height, 0.0), 1.0) if frame_height > 0 else 0.0
+                    kx_norm = min(max(kx / fw, 0.0), 1.0)
+                    ky_norm = min(max(ky / fh, 0.0), 1.0)
                     landmarks_dict[name] = LandmarkPoint(
                         name=name, x=kx, y=ky, conf=kc, x_norm=kx_norm, y_norm=ky_norm
                     )
@@ -187,7 +260,9 @@ def extract_detections_from_results(
             for name in TARGET_LANDMARKS:
                 landmarks_dict[name] = LandmarkPoint(name=name, x=0.0, y=0.0, conf=0.0)
 
-        if not is_plausible_human_pose((x1, y1, x2, y2), landmarks_dict, frame_height=frame_height):
+        if not is_plausible_human_pose(
+            (x1, y1, x2, y2), landmarks_dict, frame_width=frame_width, frame_height=frame_height
+        ):
             continue
 
         detections.append(
@@ -196,6 +271,7 @@ def extract_detections_from_results(
                 bbox_conf=bbox_conf,
                 class_id=cls_id,
                 landmarks=landmarks_dict,
+                raw_track_id=bt_id,
             )
         )
 

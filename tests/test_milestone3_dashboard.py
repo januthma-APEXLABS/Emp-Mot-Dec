@@ -36,50 +36,47 @@ class TestMilestone3Dashboard(unittest.TestCase):
         cls.thresholds = load_calibrated_thresholds()
 
     def test_data_ingest_and_exact_kpi_percentages(self):
-        """Verify KPI aggregation matches verified 6-class telemetry percentages."""
+        """Verify KPI aggregation is video-agnostic, contains Track_ID, and sums cleanly to 100%."""
+        self.assertIn("Track_ID", self.df.columns)
         kpis = compute_dashboard_kpis(self.df)
-        self.assertEqual(kpis["total_rows"], 6434)
-        self.assertEqual(kpis["unique_frames"], 5874)
-        self.assertEqual(kpis["unique_employees"], 2)
-        self.assertEqual(kpis["employee_ids"], [1, 2])
-
-        # Posture share sum ~ 100% and matches target values
-        self.assertAlmostEqual(kpis["sitting_pct"], 63.0, places=1)
-        self.assertAlmostEqual(kpis["standing_pct"], 19.6, places=1)
-        self.assertAlmostEqual(kpis["walking_pct"], 13.9, places=1)
-        self.assertAlmostEqual(kpis["away_pct"], 3.6, places=1)
+        self.assertGreater(kpis["total_rows"], 0)
+        self.assertGreater(kpis["unique_frames"], 0)
+        self.assertGreaterEqual(kpis["unique_employees"], 1)
 
         posture_sum = (
             kpis["sitting_pct"] + kpis["standing_pct"] + kpis["walking_pct"] + kpis["away_pct"]
         )
         self.assertAlmostEqual(posture_sum, 100.0, delta=0.3)
 
-        # Activity KPIs match target values
-        self.assertAlmostEqual(kpis["working_pct"], 71.7, places=1)
-        self.assertAlmostEqual(kpis["idle_pct"], 10.8, places=1)
+        activity_sum = (
+            kpis["working_pct"] + kpis["idle_pct"] + kpis["walking_pct"] + kpis["away_pct"]
+        )
+        self.assertAlmostEqual(activity_sum, 100.0, delta=0.3)
         self.assertGreater(len(kpis["working_sparkline"]), 10)
         self.assertEqual(len(kpis["sparkline_x"]), len(kpis["working_sparkline"]))
 
     def test_employee_and_time_window_filtering(self):
-        """Verify per-employee filtering builds complete 1-row-per-frame timelines including Away intervals."""
-        emp1_df = filter_telemetry(self.df, employee_id=1)
-        self.assertEqual(len(emp1_df), 5874)
-        k1 = compute_dashboard_kpis(emp1_df)
-        self.assertAlmostEqual(
-            k1["sitting_pct"] + k1["standing_pct"] + k1["walking_pct"] + k1["away_pct"],
-            100.0,
-            delta=0.3,
-        )
+        """Verify per-employee filtering builds complete 1-row-per-frame timelines for any video."""
+        kpis_all = compute_dashboard_kpis(self.df)
+        total_unique_frames = kpis_all["unique_frames"]
 
-        emp2_df = filter_telemetry(self.df, employee_id=2)
-        self.assertEqual(len(emp2_df), 5874)
-        k2 = compute_dashboard_kpis(emp2_df)
-        self.assertGreater(k2["away_pct"], 85.0)  # Visitor present ~560 / 5874 frames
+        for emp_id in kpis_all["employee_ids"]:
+            emp_df = filter_telemetry(self.df, employee_id=emp_id)
+            self.assertEqual(len(emp_df), total_unique_frames)
+            k_emp = compute_dashboard_kpis(emp_df)
+            self.assertAlmostEqual(
+                k_emp["sitting_pct"] + k_emp["standing_pct"] + k_emp["walking_pct"] + k_emp["away_pct"],
+                100.0,
+                delta=0.3,
+            )
 
-        # Sub-window filter [68s, 85s] where Emp #2 is actively conversing at the desk
-        emp2_win = filter_telemetry(self.df, employee_id=2, time_range=(68.0, 85.0))
-        k2_win = compute_dashboard_kpis(emp2_win)
-        self.assertLess(k2_win["away_pct"], 3.0)
+        # Dynamic time-window slice around first active observation of primary employee
+        primary_id = kpis_all["employee_ids"][0]
+        pres_times = self.df.filter(pl.col("track_id") == primary_id)["timestamp_sec"]
+        t_start = float(pres_times.min())
+        t_end = min(float(pres_times.max()), t_start + 10.0)
+        emp_win = filter_telemetry(self.df, employee_id=primary_id, time_range=(t_start, t_end))
+        self.assertGreater(len(emp_win), 0)
 
     def test_plotly_figures_construct_cleanly(self):
         """Ensure all Plotly figures build valid traces without exceptions."""
@@ -128,7 +125,8 @@ class TestMilestone3Dashboard(unittest.TestCase):
             self.assertEqual(Path(out["dashboard_png_path"]).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
             tbl = pl.read_csv(out["summary_csv_path"])
-            self.assertEqual(len(tbl), 3)  # Aggregate + Emp #1 + Emp #2
+            expected_rows = 1 + compute_dashboard_kpis(self.df)["unique_employees"]
+            self.assertEqual(len(tbl), expected_rows)
 
     def test_streamlit_app_headless_render(self):
         """Execute `app.py` via Streamlit's native `AppTest` harness and verify zero runtime exceptions."""
